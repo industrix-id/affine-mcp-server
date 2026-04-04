@@ -1952,7 +1952,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     const columnsValue = block.get("prop:columns");
     const cellsValue = block.get("prop:cells");
 
-    const rowEntries = mapEntries(rowsValue)
+    // Try nested Y.Map format first (original approach)
+    let rowEntries = mapEntries(rowsValue)
       .map(([rowId, payload]) => ({
         rowId,
         order:
@@ -1962,7 +1963,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }))
       .sort((a, b) => a.order.localeCompare(b.order));
 
-    const columnEntries = mapEntries(columnsValue)
+    let columnEntries = mapEntries(columnsValue)
       .map(([columnId, payload]) => ({
         columnId,
         order:
@@ -1972,19 +1973,67 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }))
       .sort((a, b) => a.order.localeCompare(b.order));
 
+    let cells = new Map<string, string>();
+
+    // If nested approach yielded nothing, try flattened dot-notation keys
+    // AFFiNE stores table props as: prop:rows.{id}.field, prop:columns.{id}.field, prop:cells.{rowId}:{colId}.text
     if (rowEntries.length === 0 || columnEntries.length === 0) {
-      return null;
+      const rows = new Map<string, Record<string, string>>();
+      const columns = new Map<string, Record<string, string>>();
+      const flatCells = new Map<string, string>();
+
+      block.forEach((value: unknown, key: string) => {
+        const rowMatch = key.match(/^prop:rows\.([^.]+)\.(\w+)$/);
+        if (rowMatch) {
+          const [, rowId, field] = rowMatch;
+          if (!rows.has(rowId)) rows.set(rowId, { rowId });
+          rows.get(rowId)![field] = value instanceof Y.Text ? value.toString() : String(value ?? "");
+          return;
+        }
+
+        const colMatch = key.match(/^prop:columns\.([^.]+)\.(\w+)$/);
+        if (colMatch) {
+          const [, colId, field] = colMatch;
+          if (!columns.has(colId)) columns.set(colId, { columnId: colId });
+          columns.get(colId)![field] = value instanceof Y.Text ? value.toString() : String(value ?? "");
+          return;
+        }
+
+        const cellMatch = key.match(/^prop:cells\.([^.]+)\.(\w+)$/);
+        if (cellMatch) {
+          const [, cellKey, field] = cellMatch;
+          if (field === "text") {
+            flatCells.set(cellKey, richTextValueToString(value));
+          }
+        }
+      });
+
+      if (rows.size > 0 && columns.size > 0) {
+        rowEntries = Array.from(rows.values())
+          .map((r) => ({ rowId: r.rowId, order: r.order ?? r.rowId }))
+          .sort((a, b) => a.order.localeCompare(b.order));
+
+        columnEntries = Array.from(columns.values())
+          .map((c) => ({ columnId: c.columnId, order: c.order ?? c.columnId }))
+          .sort((a, b) => a.order.localeCompare(b.order));
+
+        cells = flatCells;
+      }
+    } else {
+      // Nested format worked — extract cells from nested Y.Maps
+      for (const [cellKey, payload] of mapEntries(cellsValue)) {
+        if (payload instanceof Y.Map) {
+          cells.set(cellKey, richTextValueToString(payload.get("text")));
+          continue;
+        }
+        if (payload && typeof payload === "object" && "text" in payload) {
+          cells.set(cellKey, richTextValueToString((payload as any).text));
+        }
+      }
     }
 
-    const cells = new Map<string, string>();
-    for (const [cellKey, payload] of mapEntries(cellsValue)) {
-      if (payload instanceof Y.Map) {
-        cells.set(cellKey, richTextValueToString(payload.get("text")));
-        continue;
-      }
-      if (payload && typeof payload === "object" && "text" in payload) {
-        cells.set(cellKey, richTextValueToString((payload as any).text));
-      }
+    if (rowEntries.length === 0 || columnEntries.length === 0) {
+      return null;
     }
 
     const tableData: string[][] = [];
@@ -2979,6 +3028,10 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         checked: boolean | null;
         language: string | null;
         childIds: string[];
+        url: string | null;
+        sourceId: string | null;
+        caption: string | null;
+        tableData: string[][] | null;
       }> = [];
       const plainTextLines: string[] = [];
       let title = "";
@@ -3005,6 +3058,19 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           plainTextLines.push(textValue);
         }
 
+        const url = raw.get("prop:url");
+        const sourceId = raw.get("prop:sourceId");
+        const caption = raw.get("prop:caption");
+        const tableData = flavour === "affine:table" ? extractTableData(raw) : null;
+
+        // Include table cell text in plain text output
+        if (tableData) {
+          for (const row of tableData) {
+            const rowText = row.filter(Boolean).join("\t");
+            if (rowText.length > 0) plainTextLines.push(rowText);
+          }
+        }
+
         blockRows.push({
           id: blockId,
           parentId: typeof parentId === "string" ? parentId : null,
@@ -3014,6 +3080,10 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           checked: typeof checked === "boolean" ? checked : null,
           language: typeof language === "string" ? language : null,
           childIds,
+          url: typeof url === "string" ? url : null,
+          sourceId: typeof sourceId === "string" ? sourceId : null,
+          caption: typeof caption === "string" ? caption : null,
+          tableData,
         });
 
         for (const childId of childIds) {
@@ -5252,5 +5322,569 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       },
     },
     addDatabaseColumnHandler as any
+  );
+
+  // ---------------------------------------------------------------------------
+  // Table tools — affine:table block operations
+  // ---------------------------------------------------------------------------
+
+  type TableRow = { rowId: string; order: string };
+  type TableColumn = { columnId: string; order: string };
+
+  interface TableContext {
+    socket: ReturnType<typeof connectWorkspaceSocket> extends Promise<infer S> ? S : never;
+    doc: Y.Doc;
+    prevSV: Uint8Array;
+    blocks: Y.Map<any>;
+    tableBlock: Y.Map<any>;
+    rows: TableRow[];
+    columns: TableColumn[];
+    cells: Map<string, string>;
+  }
+
+  async function loadTableContext(
+    workspaceId: string,
+    docId: string,
+    tableBlockId: string,
+  ): Promise<TableContext> {
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    await joinWorkspace(socket, workspaceId);
+
+    const doc = new Y.Doc();
+    const snapshot = await loadDoc(socket, workspaceId, docId);
+    if (!snapshot.missing) {
+      socket.disconnect();
+      throw new Error("Document not found");
+    }
+    Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+
+    const prevSV = Y.encodeStateVector(doc);
+    const blocks = doc.getMap("blocks") as Y.Map<any>;
+    const tableBlock = findBlockById(blocks, tableBlockId);
+    if (!tableBlock) {
+      socket.disconnect();
+      throw new Error(`Block '${tableBlockId}' not found`);
+    }
+    const flavour = tableBlock.get("sys:flavour");
+    if (flavour !== "affine:table") {
+      socket.disconnect();
+      throw new Error(`Block '${tableBlockId}' is not a table (flavour: ${flavour})`);
+    }
+
+    // Extract structured data from flat keys
+    const rowsMap = new Map<string, Record<string, string>>();
+    const columnsMap = new Map<string, Record<string, string>>();
+    const cells = new Map<string, string>();
+
+    tableBlock.forEach((value: unknown, key: string) => {
+      const rowMatch = key.match(/^prop:rows\.([^.]+)\.(\w+)$/);
+      if (rowMatch) {
+        const [, rowId, field] = rowMatch;
+        if (!rowsMap.has(rowId)) rowsMap.set(rowId, { rowId });
+        rowsMap.get(rowId)![field] = value instanceof Y.Text ? value.toString() : String(value ?? "");
+        return;
+      }
+      const colMatch = key.match(/^prop:columns\.([^.]+)\.(\w+)$/);
+      if (colMatch) {
+        const [, colId, field] = colMatch;
+        if (!columnsMap.has(colId)) columnsMap.set(colId, { columnId: colId });
+        columnsMap.get(colId)![field] = value instanceof Y.Text ? value.toString() : String(value ?? "");
+        return;
+      }
+      const cellMatch = key.match(/^prop:cells\.([^.]+)\.(\w+)$/);
+      if (cellMatch) {
+        const [, cellKey, field] = cellMatch;
+        if (field === "text") {
+          cells.set(cellKey, richTextValueToString(value));
+        }
+      }
+    });
+
+    // Also try nested Y.Map format for backward compat
+    if (rowsMap.size === 0) {
+      const rowsValue = tableBlock.get("prop:rows");
+      for (const [rowId, payload] of mapEntries(rowsValue)) {
+        const order = payload && typeof payload === "object" && typeof payload.order === "string" ? payload.order : rowId;
+        rowsMap.set(rowId, { rowId, order });
+      }
+      const colsValue = tableBlock.get("prop:columns");
+      for (const [colId, payload] of mapEntries(colsValue)) {
+        const order = payload && typeof payload === "object" && typeof payload.order === "string" ? payload.order : colId;
+        columnsMap.set(colId, { columnId: colId, order });
+      }
+      const cellsValue = tableBlock.get("prop:cells");
+      for (const [cellKey, payload] of mapEntries(cellsValue)) {
+        if (payload instanceof Y.Map) {
+          cells.set(cellKey, richTextValueToString(payload.get("text")));
+        } else if (payload && typeof payload === "object" && "text" in payload) {
+          cells.set(cellKey, richTextValueToString((payload as any).text));
+        }
+      }
+    }
+
+    const rows = Array.from(rowsMap.values())
+      .map((r) => ({ rowId: r.rowId, order: r.order ?? r.rowId }))
+      .sort((a, b) => a.order.localeCompare(b.order));
+    const columns = Array.from(columnsMap.values())
+      .map((c) => ({ columnId: c.columnId, order: c.order ?? c.columnId }))
+      .sort((a, b) => a.order.localeCompare(b.order));
+
+    if (rows.length === 0 || columns.length === 0) {
+      socket.disconnect();
+      throw new Error(`Table block '${tableBlockId}' has no rows or columns`);
+    }
+
+    return { socket, doc, prevSV, blocks, tableBlock, rows, columns, cells };
+  }
+
+  // --- Tool 1: read_table_cells ---
+
+  const readTableCellsHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    tableBlockId: string;
+    rowIndices?: number[];
+    columnIndices?: number[];
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    const ctx = await loadTableContext(workspaceId, parsed.docId, parsed.tableBlockId);
+    try {
+      const colFilter = parsed.columnIndices ? new Set(parsed.columnIndices) : null;
+      const filteredColumns = ctx.columns.filter((_, i) => !colFilter || colFilter.has(i));
+
+      // Row 0 = headers, rows 1..N = data rows (0-based in ctx.rows)
+      const dataRowCount = ctx.rows.length - 1;
+
+      // Validate rowIndices up front
+      if (parsed.rowIndices) {
+        for (const idx of parsed.rowIndices) {
+          if (idx < 0 || idx >= dataRowCount) {
+            throw new Error(`rowIndex ${idx} out of range. Data rows: 0-${dataRowCount - 1} (${dataRowCount} total). Row indices are 0-based offsets into data rows (header row is excluded).`);
+          }
+        }
+      }
+      const rowFilter = parsed.rowIndices ? new Set(parsed.rowIndices) : null;
+
+      // Extract headers from first row
+      const headers: string[] = [];
+      if (ctx.rows.length > 0) {
+        const headerRow = ctx.rows[0];
+        for (const col of filteredColumns) {
+          headers.push(ctx.cells.get(`${headerRow.rowId}:${col.columnId}`) ?? "");
+        }
+      }
+
+      // Extract data rows (ctx.rows[1..N] → reported as dataIndex 0..N-1)
+      const rows: Array<{ index: number; rowId: string; cells: string[] }> = [];
+      for (let i = 0; i < dataRowCount; i++) {
+        if (rowFilter && !rowFilter.has(i)) continue;
+        const row = ctx.rows[i + 1]; // +1 to skip header
+        const cellValues: string[] = [];
+        for (const col of filteredColumns) {
+          cellValues.push(ctx.cells.get(`${row.rowId}:${col.columnId}`) ?? "");
+        }
+        rows.push({ index: i, rowId: row.rowId, cells: cellValues });
+      }
+
+      return text({ headers, rows, totalRows: dataRowCount, totalColumns: ctx.columns.length });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "read_table_cells",
+    {
+      title: "Read Table Cells",
+      description: "Read cell values from an affine:table block. Returns headers (first row) and data rows. Use rowIndices/columnIndices to filter.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the table"),
+        tableBlockId: z.string().min(1).describe("Block ID of the affine:table block"),
+        rowIndices: z.array(z.number().int().min(0)).optional().describe("Optional 0-based data row indices to return (header row is always included separately)"),
+        columnIndices: z.array(z.number().int().min(0)).optional().describe("Optional 0-based column indices to return"),
+      },
+    },
+    readTableCellsHandler as any
+  );
+
+  // --- Tool 2: update_table_cell ---
+
+  const updateTableCellHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    tableBlockId: string;
+    rowIndex: number;
+    columnIndex: number;
+    value: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    const ctx = await loadTableContext(workspaceId, parsed.docId, parsed.tableBlockId);
+    try {
+      if (parsed.rowIndex < 0 || parsed.rowIndex >= ctx.rows.length) {
+        throw new Error(`rowIndex ${parsed.rowIndex} out of range (0-${ctx.rows.length - 1})`);
+      }
+      if (parsed.columnIndex < 0 || parsed.columnIndex >= ctx.columns.length) {
+        throw new Error(`columnIndex ${parsed.columnIndex} out of range (0-${ctx.columns.length - 1})`);
+      }
+
+      const row = ctx.rows[parsed.rowIndex];
+      const col = ctx.columns[parsed.columnIndex];
+      const cellKey = `${row.rowId}:${col.columnId}`;
+      const textKey = `prop:cells.${cellKey}.text`;
+
+      // Delete existing text key and set new one
+      const existing = ctx.tableBlock.get(textKey);
+      if (existing instanceof Y.Text) {
+        existing.delete(0, existing.length);
+        existing.insert(0, parsed.value);
+      } else {
+        ctx.tableBlock.set(textKey, makeText(parsed.value));
+      }
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({ updated: true, rowIndex: parsed.rowIndex, columnIndex: parsed.columnIndex, value: parsed.value });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "update_table_cell",
+    {
+      title: "Update Table Cell",
+      description: "Write a value to a specific cell in an affine:table block by row and column index.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the table"),
+        tableBlockId: z.string().min(1).describe("Block ID of the affine:table block"),
+        rowIndex: z.number().int().min(0).describe("0-based row index (0 = header row)"),
+        columnIndex: z.number().int().min(0).describe("0-based column index"),
+        value: z.string().describe("New cell text value"),
+      },
+    },
+    updateTableCellHandler as any
+  );
+
+  // --- Tool 3: append_table_row ---
+
+  const appendTableRowHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    tableBlockId: string;
+    cells: string[];
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    const ctx = await loadTableContext(workspaceId, parsed.docId, parsed.tableBlockId);
+    try {
+      if (parsed.cells.length !== ctx.columns.length) {
+        throw new Error(`cells array length (${parsed.cells.length}) must match column count (${ctx.columns.length})`);
+      }
+
+      const newRowId = generateId();
+
+      // Calculate next order value: find the max existing order and increment
+      const lastOrder = ctx.rows.length > 0 ? ctx.rows[ctx.rows.length - 1].order : "r-001";
+      const orderNum = parseInt(lastOrder.replace(/^r/, ""), 10);
+      const nextOrder = `r${String((isNaN(orderNum) ? ctx.rows.length : orderNum) + 1).padStart(4, "0")}`;
+
+      // Set row keys
+      ctx.tableBlock.set(`prop:rows.${newRowId}.rowId`, newRowId);
+      ctx.tableBlock.set(`prop:rows.${newRowId}.order`, nextOrder);
+
+      // Set cell keys
+      for (let i = 0; i < ctx.columns.length; i++) {
+        const col = ctx.columns[i];
+        ctx.tableBlock.set(`prop:cells.${newRowId}:${col.columnId}.text`, makeText(parsed.cells[i]));
+      }
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({ appended: true, rowId: newRowId, order: nextOrder, rowIndex: ctx.rows.length });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "append_table_row",
+    {
+      title: "Append Table Row",
+      description: "Add a new row to the end of an affine:table block. Provide cell values matching the column count.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the table"),
+        tableBlockId: z.string().min(1).describe("Block ID of the affine:table block"),
+        cells: z.array(z.string()).min(1).describe("Cell values for the new row — must match column count"),
+      },
+    },
+    appendTableRowHandler as any
+  );
+
+  // --- Tool 4: delete_table_row ---
+
+  const deleteTableRowHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    tableBlockId: string;
+    rowIndex: number;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    const ctx = await loadTableContext(workspaceId, parsed.docId, parsed.tableBlockId);
+    try {
+      if (parsed.rowIndex < 0 || parsed.rowIndex >= ctx.rows.length) {
+        throw new Error(`rowIndex ${parsed.rowIndex} out of range (0-${ctx.rows.length - 1})`);
+      }
+
+      const row = ctx.rows[parsed.rowIndex];
+
+      // Collect all keys to delete for this row
+      const keysToDelete: string[] = [];
+      ctx.tableBlock.forEach((_: unknown, key: string) => {
+        if (key.startsWith(`prop:rows.${row.rowId}.`)) {
+          keysToDelete.push(key);
+        }
+        if (key.startsWith(`prop:cells.${row.rowId}:`)) {
+          keysToDelete.push(key);
+        }
+      });
+
+      for (const key of keysToDelete) {
+        ctx.tableBlock.delete(key);
+      }
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({ deleted: true, rowIndex: parsed.rowIndex, rowId: row.rowId, keysRemoved: keysToDelete.length });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "delete_table_row",
+    {
+      title: "Delete Table Row",
+      description: "Remove a row from an affine:table block by index. Deletes the row and all its cell data.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the table"),
+        tableBlockId: z.string().min(1).describe("Block ID of the affine:table block"),
+        rowIndex: z.number().int().min(0).describe("0-based row index to delete (0 = header row — use with caution)"),
+      },
+    },
+    deleteTableRowHandler as any
+  );
+
+  // --- Tool 5: list_blocks_by_type ---
+
+  const listBlocksByTypeHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    flavour: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snapshot.missing) throw new Error("Document not found");
+
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      const targetFlavour = parsed.flavour.startsWith("affine:") ? parsed.flavour : `affine:${parsed.flavour}`;
+      const results: Array<{ blockId: string; nearestHeading: string | null; preview: string }> = [];
+
+      // Traverse the document tree in order to track nearest heading before each block.
+      // Table blocks may have sys:parent: null, so parent-sibling walking doesn't work.
+      // Instead, do a depth-first walk from the page/note root — the sys:children arrays
+      // define document order. Track the last heading seen during the walk.
+      const pageId = findBlockIdByFlavour(blocks, "affine:page");
+      const noteId = findBlockIdByFlavour(blocks, "affine:note");
+      const startIds: string[] = [];
+      if (pageId) startIds.push(pageId);
+      else if (noteId) startIds.push(noteId);
+      else {
+        // Fallback: iterate all blocks
+        for (const [id] of blocks) startIds.push(String(id));
+      }
+
+      const visited = new Set<string>();
+      let lastHeading: string | null = null;
+      // Map from blockId → nearest heading seen before it in document order
+      const headingContext = new Map<string, string | null>();
+
+      const walk = (blockId: string) => {
+        if (visited.has(blockId)) return;
+        visited.add(blockId);
+        const block = findBlockById(blocks, blockId);
+        if (!block) return;
+
+        const f = block.get("sys:flavour");
+        const t = block.get("prop:type");
+
+        // Track headings as we encounter them in document order
+        if (f === "affine:paragraph" && typeof t === "string" && /^h[1-6]$/.test(t)) {
+          const heading = asText(block.get("prop:text"));
+          if (heading) lastHeading = heading;
+        }
+
+        // Record the current heading context for every block
+        headingContext.set(blockId, lastHeading);
+
+        // Recurse into children (document order)
+        const childIds = childIdsFrom(block.get("sys:children"));
+        for (const childId of childIds) {
+          walk(childId);
+        }
+      };
+      for (const id of startIds) walk(id);
+
+      // Also visit any blocks not reachable from the tree (orphans)
+      for (const [id] of blocks) {
+        const blockId = String(id);
+        if (!visited.has(blockId)) {
+          walk(blockId);
+        }
+      }
+
+      // Collect results for matching blocks
+      for (const [blockId, heading] of headingContext) {
+        const block = findBlockById(blocks, blockId);
+        if (!block) continue;
+        const f = block.get("sys:flavour");
+        if (f !== targetFlavour) continue;
+
+        let preview = "";
+        if (f === "affine:table") {
+          const tableData = extractTableData(block);
+          if (tableData) {
+            preview = `${tableData.length} rows × ${tableData[0]?.length ?? 0} cols`;
+          } else {
+            preview = "empty table";
+          }
+        } else {
+          const t = asText(block.get("prop:text"));
+          preview = t.length > 80 ? t.slice(0, 80) + "…" : t;
+        }
+
+        results.push({ blockId, nearestHeading: heading, preview });
+      }
+
+      return text({ flavour: targetFlavour, count: results.length, blocks: results });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "list_blocks_by_type",
+    {
+      title: "List Blocks by Type",
+      description: "Find all blocks of a given flavour in a document. Returns blockId, nearest heading context, and a preview for each match.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID to search"),
+        flavour: z.string().min(1).describe("Block flavour to find (e.g. 'table', 'database', 'paragraph'). The 'affine:' prefix is added automatically if omitted."),
+      },
+    },
+    listBlocksByTypeHandler as any
+  );
+
+  // --- Tool 6: read_block ---
+
+  const readBlockHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    blockId: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snapshot.missing) throw new Error("Document not found");
+
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      const rootBlock = findBlockById(blocks, parsed.blockId);
+      if (!rootBlock) throw new Error(`Block '${parsed.blockId}' not found`);
+
+      // Collect the subtree rooted at this block
+      const blocksById = new Map<string, MarkdownRenderableBlock>();
+      const visited = new Set<string>();
+
+      const visit = (blockId: string) => {
+        if (visited.has(blockId)) return;
+        visited.add(blockId);
+        const block = findBlockById(blocks, blockId);
+        if (!block) return;
+
+        const childIds = childIdsFrom(block.get("sys:children"));
+        blocksById.set(blockId, {
+          id: blockId,
+          parentId: asStringOrNull(block.get("sys:parent")),
+          flavour: asStringOrNull(block.get("sys:flavour")),
+          type: asStringOrNull(block.get("prop:type")),
+          text: asText(block.get("prop:text")) || null,
+          checked: typeof block.get("prop:checked") === "boolean" ? Boolean(block.get("prop:checked")) : null,
+          language: asStringOrNull(block.get("prop:language")),
+          childIds,
+          url: asStringOrNull(block.get("prop:url")),
+          sourceId: asStringOrNull(block.get("prop:sourceId")),
+          caption: asStringOrNull(block.get("prop:caption")),
+          tableData: block.get("sys:flavour") === "affine:table" ? extractTableData(block) : null,
+        });
+        for (const childId of childIds) {
+          visit(childId);
+        }
+      };
+      visit(parsed.blockId);
+
+      const rendered = renderBlocksToMarkdown({
+        rootBlockIds: [parsed.blockId],
+        blocksById,
+      });
+
+      return text({
+        blockId: parsed.blockId,
+        flavour: asStringOrNull(rootBlock.get("sys:flavour")),
+        blockCount: blocksById.size,
+        markdown: rendered.markdown,
+        warnings: rendered.warnings,
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "read_block",
+    {
+      title: "Read Block",
+      description: "Read a specific block and its descendant subtree, rendered as markdown. Useful for reading one section of a large doc without exporting everything.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the block"),
+        blockId: z.string().min(1).describe("Block ID to read (renders this block and all its children as markdown)"),
+      },
+    },
+    readBlockHandler as any
   );
 }

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 No unreleased changes yet.
 
+## [1.12.0] - 2026-04-04
+
+### Added
+- Table block tools:
+  - `read_table_cells`
+  - `update_table_cell`
+  - `append_table_row`
+  - `delete_table_row`
+- Block discovery and inspection tools:
+  - `list_blocks_by_type`
+  - `read_block`
+
+### Changed
+- Tool surface expanded from 76 to 82 canonical tools.
+- `read_doc` blocks array now includes `tableData`, `url`, `sourceId`, and `caption` fields, matching `export_doc_markdown` output.
+- `read_doc` plain text output now includes table cell content.
+
+### Fixed
+- Fixed `extractTableData()` returning null for all `affine:table` blocks because AFFiNE stores table properties as flattened dot-notation keys (`prop:rows.{id}.field`) rather than nested Y.Maps.
+- Fixed `list_blocks_by_type` heading context lookup — switched from parent-sibling walking (failed when blocks have `sys:parent: null`) to document-order tree traversal.
+- Fixed `read_table_cells` off-by-one error with `rowIndices` filter — switched to 0-based data row indexing with explicit bounds validation.
+- Fixed operator precedence bug in heading detection that only matched `h1` correctly.
+
 ## [1.11.2] - 2026-03-31
 
 ### Fixed
@@ -358,6 +381,7 @@ Document create/edit/delete is now supported. These are synchronized to real AFF
 - User management
 - Access tokens
 
+[1.12.0]: https://github.com/dawncr0w/affine-mcp-server/releases/tag/v1.12.0
 [1.11.2]: https://github.com/dawncr0w/affine-mcp-server/releases/tag/v1.11.2
 [1.11.1]: https://github.com/dawncr0w/affine-mcp-server/releases/tag/v1.11.1
 [1.11.0]: https://github.com/dawncr0w/affine-mcp-server/releases/tag/v1.11.0
@@ -377,4 +401,4 @@ Document create/edit/delete is now supported. These are synchronized to real AFF
 [1.4.0]: https://github.com/dawncr0w/affine-mcp-server/releases/tag/v1.4.0
 [1.3.0]: https://github.com/dawncr0w/affine-mcp-server/releases/tag/v1.3.0
 [1.6.0]: https://github.com/dawncr0w/affine-mcp-server/releases/tag/v1.6.0
-[Unreleased]: https://github.com/dawncr0w/affine-mcp-server/compare/v1.11.2...HEAD
+[Unreleased]: https://github.com/dawncr0w/affine-mcp-server/compare/v1.12.0...HEAD

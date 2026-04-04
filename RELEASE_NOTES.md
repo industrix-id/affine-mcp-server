@@ -1,5 +1,34 @@
 # Release Notes
 
+## Version 1.12.0 (2026-04-04)
+
+### Highlights
+- Fixed `affine:table` block reading — tables were exporting as empty due to a property key format mismatch between the MCP server and AFFiNE's flattened Y.js CRDT storage.
+- Added 6 new tools for table block CRUD and block discovery: `read_table_cells`, `update_table_cell`, `append_table_row`, `delete_table_row`, `list_blocks_by_type`, `read_block`.
+- Enriched `read_doc` block output with `tableData`, `url`, `sourceId`, `caption`, and table content in plain text.
+
+### What Changed
+- `src/tools/docs.ts`
+  - Fixed `extractTableData()` to scan flattened dot-notation keys (`prop:rows.{id}.field`) instead of expecting nested Y.Maps. Supports both formats for backward compatibility.
+  - Fixed `readDocHandler` block rows to include `tableData`, `url`, `sourceId`, and `caption` fields. Added table cell content to `plainText` output.
+  - Added `loadTableContext()` shared helper for table block socket lifecycle and structured data extraction.
+  - Added `read_table_cells` tool to read headers and data rows with optional row/column index filters.
+  - Added `update_table_cell` tool to write to a specific cell by row and column index.
+  - Added `append_table_row` tool to add rows with auto-generated IDs and incremented order keys.
+  - Added `delete_table_row` tool to remove a row and all its cell data.
+  - Added `list_blocks_by_type` tool with document-order heading context and block previews.
+  - Added `read_block` tool to render a block subtree as markdown.
+  - Fixed `list_blocks_by_type` heading lookup — replaced parent-sibling walking with document-order tree traversal (handles blocks with `sys:parent: null`).
+  - Fixed operator precedence bug in heading detection condition.
+  - Fixed `read_table_cells` off-by-one with `rowIndices` — switched to 0-based data row indexing with bounds validation.
+- `package.json`, `package-lock.json`, `tool-manifest.json`, `README.md`, `CHANGELOG.md`, `RELEASE_NOTES.md`
+  - Bumped release metadata to `1.12.0`.
+  - Tool manifest expanded from 76 to 82 tools.
+
+### Validation Evidence
+- Build passed: `pnpm run build`
+- Global install verified: `pnpm link --global` → `affine-mcp --version` returns `1.12.0`
+
 ## Version 1.11.2 (2026-03-31)
 
 ### Highlights
