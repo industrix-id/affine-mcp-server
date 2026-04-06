@@ -5,7 +5,7 @@ import * as Y from "yjs";
 import FormData from "form-data";
 import fetch from "node-fetch";
 import { text } from "../util/mcp.js";
-import { connectWorkspaceSocket, joinWorkspace, pushDocUpdate, wsUrlFromGraphQLEndpoint } from "../ws.js";
+import { connectWorkspaceSocket, joinWorkspace, loadDoc, pushDocUpdate, wsUrlFromGraphQLEndpoint } from "../ws.js";
 
 // Generate AFFiNE-style document ID
 function generateDocId(): string {
@@ -137,7 +137,34 @@ export function registerWorkspaceTools(server: McpServer, gql: GraphQLClient) {
     try {
       const query = `query { workspaces { id public enableAi createdAt } }`;
       const data = await gql.request<{ workspaces: any[] }>(query);
-      return text(data.workspaces || []);
+      const workspaces = data.workspaces || [];
+
+      // Fetch workspace names from root YDocs via WebSocket
+      const wsUrl = wsUrlFromGraphQLEndpoint(gql.endpoint);
+      let socket;
+      try {
+        socket = await connectWorkspaceSocket(wsUrl, gql.cookie, gql.bearer);
+        for (const ws of workspaces) {
+          try {
+            await joinWorkspace(socket, ws.id);
+            const snapshot = await loadDoc(socket, ws.id, ws.id);
+            if (snapshot.missing) {
+              const rootDoc = new Y.Doc();
+              Y.applyUpdate(rootDoc, Buffer.from(snapshot.missing, "base64"));
+              const meta = rootDoc.getMap("meta");
+              ws.name = meta.get("name") || null;
+            }
+          } catch {
+            ws.name = null;
+          }
+        }
+      } catch {
+        // WebSocket unavailable — return workspaces without names
+      } finally {
+        socket?.disconnect();
+      }
+
+      return text(workspaces);
     } catch (error: any) {
       return text({ error: error.message });
     }

@@ -1,5 +1,20 @@
 # Release Notes
 
+## Version 1.13.0 (2026-04-06)
+
+### Highlights
+- `list_workspaces` now returns workspace names alongside existing fields (id, public, enableAi, createdAt).
+
+### What Changed
+- `src/tools/workspaces.ts`
+  - `listWorkspacesHandler` now connects via WebSocket after the GraphQL query, loads each workspace's root YDoc, and extracts the name from `meta.get("name")`.
+  - Added `loadDoc` import from `../ws.js`.
+  - Gracefully falls back to `name: null` if WebSocket is unavailable or a workspace root doc cannot be loaded.
+
+### Validation Evidence
+- CI passed: `pnpm run ci` (build + tool-manifest + pack:check)
+- Live test passed: `list_workspaces` returns names for all 3 workspaces
+
 ## Version 1.12.0 (2026-04-04)
 
 ### Highlights
