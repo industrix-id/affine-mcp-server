@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 No unreleased changes yet.
 
+## [1.14.0] - 2026-04-06
+
+### Added
+- Database view filter/sort tools:
+  - `get_database_view_filter` — read current filter and sort config from a view
+  - `set_database_view_filter` — set filter conditions using BlockSuite operators
+  - `clear_database_view_filter` — reset view to unfiltered/unsorted
+  - `set_database_view_sort` — configure multi-column sort order
+  - `limit_database_view_rows` — sort to surface top/bottom N rows
+
+### Changed
+- Tool surface expanded from 82 to 87 canonical tools.
+- `read_database_columns` views output now includes `filter` and `sort` fields.
+- `list_workspaces` now returns workspace names by fetching root YDoc metadata via WebSocket.
+
 ## [1.13.0] - 2026-04-06
 
 ### Changed

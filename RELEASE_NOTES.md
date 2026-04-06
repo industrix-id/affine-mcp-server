@@ -1,5 +1,32 @@
 # Release Notes
 
+## Version 1.14.0 (2026-04-06)
+
+### Highlights
+- Added 5 new tools for database view filter and sort management: `get_database_view_filter`, `set_database_view_filter`, `clear_database_view_filter`, `set_database_view_sort`, `limit_database_view_rows`.
+- `list_workspaces` now returns workspace names.
+- `read_database_columns` views output now includes filter and sort configuration.
+
+### What Changed
+- `src/tools/docs.ts`
+  - Added `DatabaseViewDef.filter` and `DatabaseViewDef.sort` fields; `readDatabaseViewDefs` now extracts them.
+  - Added `resolveView()` helper to locate a view Y.Map by ID (defaults to first view).
+  - Added `get_database_view_filter` tool to read filter + sort config.
+  - Added `set_database_view_filter` tool using BlockSuite `FilterGroup`/`SingleFilter` CRDT format.
+  - Added `clear_database_view_filter` tool to reset view to unfiltered/unsorted.
+  - Added `set_database_view_sort` tool using BlockSuite `Sort` format.
+  - Added `limit_database_view_rows` tool (sort-based, since BlockSuite has no native row limit).
+- `src/tools/workspaces.ts`
+  - `listWorkspacesHandler` fetches workspace names from root YDocs via WebSocket.
+- `package.json`, `package-lock.json`, `tool-manifest.json`, `README.md`, `CHANGELOG.md`, `RELEASE_NOTES.md`
+  - Bumped release metadata to `1.14.0`.
+  - Tool manifest expanded from 82 to 87 tools.
+
+### Validation Evidence
+- CI passed: `pnpm run ci` (build + tool-manifest + pack:check)
+- Live tests passed: all 5 new tools verified against AFFiNE instance
+- Global install verified: `affine-mcp --version` returns `1.14.0`
+
 ## Version 1.13.0 (2026-04-06)
 
 ### Highlights

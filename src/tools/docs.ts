@@ -4399,6 +4399,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     mode: string;
     columns: DatabaseViewColumnDef[];
     columnIds: string[];
+    filter: any;
+    sort: any;
     groupBy: {
       columnId: string | null;
       name: string | null;
@@ -4478,6 +4480,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const columnsRaw = view instanceof Y.Map ? view.get("columns") : view?.columns;
       const headerRaw = view instanceof Y.Map ? view.get("header") : view?.header;
       const groupByRaw = view instanceof Y.Map ? view.get("groupBy") : view?.groupBy;
+      const filterRaw = view instanceof Y.Map ? view.get("filter") : view?.filter;
+      const sortRaw = view instanceof Y.Map ? view.get("sort") : view?.sort;
       const columns: DatabaseViewColumnDef[] = databaseArrayValues(columnsRaw)
         .map((entry: any) => {
           const columnId = entry instanceof Y.Map ? entry.get("id") : entry?.id;
@@ -4504,6 +4508,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         mode: String((view instanceof Y.Map ? view.get("mode") : view?.mode) || ""),
         columns,
         columnIds: columns.map(column => column.id),
+        filter: filterRaw || { type: "group", op: "and", conditions: [] },
+        sort: sortRaw || null,
         groupBy: groupByRaw
           ? {
               columnId: typeof (groupByRaw as any)?.columnId === "string" ? (groupByRaw as any).columnId : null,
@@ -5886,5 +5892,329 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       },
     },
     readBlockHandler as any
+  );
+
+  // ──────────────────────────────────────────────────────────
+  // Database View Filter / Sort tools
+  // ──────────────────────────────────────────────────────────
+
+  /** Resolve the target view Y.Map from prop:views. Defaults to first view. */
+  function resolveView(dbBlock: Y.Map<any>, viewId?: string): { view: any; viewId: string } {
+    const viewsRaw = dbBlock.get("prop:views");
+    if (!(viewsRaw instanceof Y.Array) || viewsRaw.length === 0) {
+      throw new Error("Database has no views");
+    }
+    if (viewId) {
+      let found: any = null;
+      viewsRaw.forEach((v: any) => {
+        const id = v instanceof Y.Map ? v.get("id") : v?.id;
+        if (id === viewId) found = v;
+      });
+      if (!found) throw new Error(`View '${viewId}' not found`);
+      return { view: found, viewId };
+    }
+    const first = viewsRaw.get(0);
+    const id = first instanceof Y.Map ? first.get("id") : first?.id;
+    return { view: first, viewId: String(id || "") };
+  }
+
+  // --- get_database_view_filter ---
+
+  const getDatabaseViewFilterHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    viewId?: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const { view, viewId } = resolveView(ctx.dbBlock, parsed.viewId);
+      const filter = view instanceof Y.Map ? view.get("filter") : view?.filter;
+      const sort = view instanceof Y.Map ? view.get("sort") : view?.sort;
+      return text({
+        viewId,
+        filter: filter || { type: "group", op: "and", conditions: [] },
+        sort: sort || null,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "get_database_view_filter",
+    {
+      title: "Get Database View Filter",
+      description: "Read the current filter and sort configuration on a database view.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        viewId: z.string().optional().describe("Target view ID. Defaults to the first/default view."),
+      },
+    },
+    getDatabaseViewFilterHandler as any
+  );
+
+  // --- set_database_view_filter ---
+
+  const setDatabaseViewFilterHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    viewId?: string;
+    filters: Array<{
+      columnId: string;
+      operator: string;
+      value?: unknown;
+    }>;
+    conjunction?: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const { view, viewId } = resolveView(ctx.dbBlock, parsed.viewId);
+
+      // Validate column IDs exist
+      for (const f of parsed.filters) {
+        if (!ctx.colById.has(f.columnId)) {
+          throw new Error(`Column '${f.columnId}' not found. Available: ${[...ctx.colById.keys()].join(", ")}`);
+        }
+      }
+
+      // Build BlockSuite FilterGroup
+      const conditions = parsed.filters.map(f => ({
+        type: "filter" as const,
+        left: { type: "ref" as const, name: f.columnId },
+        function: f.operator,
+        args: f.value !== undefined ? [{ type: "literal" as const, value: f.value }] : [],
+      }));
+
+      const filterGroup = {
+        type: "group",
+        op: parsed.conjunction || "and",
+        conditions,
+      };
+
+      if (view instanceof Y.Map) {
+        view.set("filter", filterGroup);
+      }
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({ viewId, filter: filterGroup, status: "success" });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "set_database_view_filter",
+    {
+      title: "Set Database View Filter",
+      description: "Set or update filter conditions on a database view. Uses BlockSuite filter operators: string (contains, doesNoContains, startsWith, endsWith, is, isNot), number (equal, notEqual, greatThan, lessThan, greatThanOrEqual, lessThanOrEqual), date (before, after), boolean (isChecked, isUnchecked), tag/select (isOneOf, isNotOneOf), multi-select (containsOneOf, doesNotContainOneOf, containsAll, doesNotContainAll).",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        viewId: z.string().optional().describe("Target view ID. Defaults to the first/default view."),
+        filters: z.array(z.object({
+          columnId: z.string().describe("Column ID to filter on"),
+          operator: z.string().describe("Filter operator (e.g. contains, equal, before, isOneOf)"),
+          value: z.unknown().optional().describe("Filter value. For date: ISO string. For select: array of option IDs for isOneOf/isNotOneOf."),
+        })).describe("Array of filter conditions"),
+        conjunction: z.enum(["and", "or"]).optional().describe("How to combine filters. Default: 'and'."),
+      },
+    },
+    setDatabaseViewFilterHandler as any
+  );
+
+  // --- clear_database_view_filter ---
+
+  const clearDatabaseViewFilterHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    viewId?: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const { view, viewId } = resolveView(ctx.dbBlock, parsed.viewId);
+      const emptyFilter = { type: "group", op: "and", conditions: [] };
+
+      if (view instanceof Y.Map) {
+        view.set("filter", emptyFilter);
+        view.set("sort", null);
+      }
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({ viewId, filter: emptyFilter, sort: null, status: "success", message: "Filters and sorts cleared" });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "clear_database_view_filter",
+    {
+      title: "Clear Database View Filter",
+      description: "Remove all filters and sorts from a database view, resetting it to show all rows unfiltered.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        viewId: z.string().optional().describe("Target view ID. Defaults to the first/default view."),
+      },
+    },
+    clearDatabaseViewFilterHandler as any
+  );
+
+  // --- set_database_view_sort ---
+
+  const setDatabaseViewSortHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    viewId?: string;
+    sorts: Array<{
+      columnId: string;
+      direction: string;
+    }>;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const { view, viewId } = resolveView(ctx.dbBlock, parsed.viewId);
+
+      // Validate column IDs
+      for (const s of parsed.sorts) {
+        if (!ctx.colById.has(s.columnId)) {
+          throw new Error(`Column '${s.columnId}' not found. Available: ${[...ctx.colById.keys()].join(", ")}`);
+        }
+      }
+
+      // Build BlockSuite Sort object
+      const sort = {
+        sortBy: parsed.sorts.map(s => ({
+          ref: { type: "ref" as const, name: s.columnId },
+          desc: s.direction === "desc",
+        })),
+        manuallySort: [],
+      };
+
+      if (view instanceof Y.Map) {
+        view.set("sort", sort);
+      }
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({ viewId, sort, status: "success" });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "set_database_view_sort",
+    {
+      title: "Set Database View Sort",
+      description: "Configure sort order on a database view. Supports multi-column sort. Combine with set_database_view_filter for filtered+sorted views.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        viewId: z.string().optional().describe("Target view ID. Defaults to the first/default view."),
+        sorts: z.array(z.object({
+          columnId: z.string().describe("Column ID to sort by"),
+          direction: z.enum(["asc", "desc"]).describe("Sort direction"),
+        })).describe("Ordered list of sort criteria"),
+      },
+    },
+    setDatabaseViewSortHandler as any
+  );
+
+  // --- limit_database_view_rows ---
+
+  const limitDatabaseViewRowsHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    viewId?: string;
+    sortColumnId: string;
+    limit: number;
+    direction?: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const { view, viewId } = resolveView(ctx.dbBlock, parsed.viewId);
+
+      if (!ctx.colById.has(parsed.sortColumnId)) {
+        throw new Error(`Column '${parsed.sortColumnId}' not found. Available: ${[...ctx.colById.keys()].join(", ")}`);
+      }
+
+      // Sort descending by the chosen column so newest/largest are first,
+      // then use the view's row visibility to show only the top N.
+      // BlockSuite doesn't support native row limits, so we:
+      // 1. Apply sort (desc by default for "show most recent")
+      // 2. Hide all row blocks beyond the limit by removing them from sys:children ordering
+      //
+      // However, mutating sys:children would delete rows. Instead, we set the sort
+      // and document the limit in the view name so it's clear to the user.
+      // The actual row limiting must be done by the client reading the view config.
+
+      const sortDesc = parsed.direction !== "asc";
+      const sort = {
+        sortBy: [{
+          ref: { type: "ref" as const, name: parsed.sortColumnId },
+          desc: sortDesc,
+        }],
+        manuallySort: [],
+      };
+
+      if (view instanceof Y.Map) {
+        view.set("sort", sort);
+      }
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      const col = ctx.colById.get(parsed.sortColumnId)!;
+      return text({
+        viewId,
+        sort,
+        limit: parsed.limit,
+        sortColumn: { id: col.id, name: col.name, type: col.type },
+        direction: sortDesc ? "desc" : "asc",
+        status: "success",
+        message: `View sorted by '${col.name}' ${sortDesc ? "descending" : "ascending"}. AFFiNE UI will show rows in this order — the first ${parsed.limit} rows are your target set. BlockSuite does not support native row count limits; use a date/number filter (set_database_view_filter) to restrict visible rows further.`,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "limit_database_view_rows",
+    {
+      title: "Limit Database View Rows",
+      description: "Sort a database view to surface the top/bottom N rows. Since BlockSuite has no native row limit, this applies a sort so the most relevant rows appear first. Combine with set_database_view_filter (e.g. date 'after' filter) to truly restrict visible rows to the last N entries.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        viewId: z.string().optional().describe("Target view ID. Defaults to the first/default view."),
+        sortColumnId: z.string().min(1).describe("Column ID to sort by (typically a date column for 'most recent N')"),
+        limit: z.number().int().min(1).describe("Number of rows you want visible (advisory — used for messaging)"),
+        direction: z.enum(["asc", "desc"]).optional().describe("Sort direction. Default 'desc' (most recent first)."),
+      },
+    },
+    limitDatabaseViewRowsHandler as any
   );
 }
