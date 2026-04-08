@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 No unreleased changes yet.
 
+## [1.15.0] - 2026-04-09
+
+### Added
+- Block manipulation tools (8 new tools):
+  - `list_blocks` — lightweight block tree with IDs, types, and text previews
+  - `find_blocks` — search blocks by text content with case-insensitive matching
+  - `delete_blocks` — remove blocks and subtrees by block ID
+  - `update_block` — update text, type, or properties of a single block in place
+  - `insert_markdown` — insert markdown at a specific position (before/after block)
+  - `move_block` — move a block and its subtree to a new position
+  - `replace_section` — replace content under a heading until the next same-level heading
+  - `batch_resolve_comments` — resolve multiple comments in a single call
+- Extended existing tools:
+  - `find_and_replace` + `scopeBlockId` — limit replacements to a block subtree
+  - `replace_doc_with_markdown` + `preserveBlockIds` — replace content while keeping specific blocks (e.g., embedded docs) alive
+
+### Changed
+- Tool surface expanded from 87 to 95 canonical tools.
+- Table row/column limit raised from 20 to 100 for `append_block` table creation and markdown table import.
+
 ## [1.14.0] - 2026-04-06
 
 ### Added

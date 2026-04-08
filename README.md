@@ -16,10 +16,10 @@ A Model Context Protocol (MCP) server that integrates with AFFiNE (self‑hosted
 - Purpose: Manage AFFiNE workspaces and documents through MCP
 - Transport: stdio (default) and optional HTTP (`/mcp`) for remote MCP deployments
 - Auth: Token, Cookie, or Email/Password (priority order)
-- Tools: 87 focused tools with WebSocket-based document editing
+- Tools: 95 focused tools with WebSocket-based document editing
 - Status: Active
  
-> New in v1.14.0: Database view filter/sort tools — `set_database_view_filter`, `set_database_view_sort`, `get_database_view_filter`, `clear_database_view_filter`, `limit_database_view_rows`.
+> New in v1.15.0: Block manipulation tools — `list_blocks`, `find_blocks`, `delete_blocks`, `update_block`, `insert_markdown`, `move_block`, `replace_section`, `batch_resolve_comments`. Plus `scopeBlockId` for `find_and_replace` and `preserveBlockIds` for `replace_doc_with_markdown`.
 
 ## Features
 

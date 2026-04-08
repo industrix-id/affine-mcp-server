@@ -1,5 +1,33 @@
 # Release Notes
 
+## Version 1.15.0 (2026-04-09)
+
+### Highlights
+- Added 8 new block manipulation tools for surgical document editing: `list_blocks`, `find_blocks`, `delete_blocks`, `update_block`, `insert_markdown`, `move_block`, `replace_section`, `batch_resolve_comments`.
+- Extended `find_and_replace` with `scopeBlockId` to limit replacements to a block subtree.
+- Extended `replace_doc_with_markdown` with `preserveBlockIds` to keep specific blocks (e.g., embedded linked docs) alive during full document replacement.
+- Raised table row/column limit from 20 to 100 for markdown table import.
+
+### What Changed
+- `src/tools/docs.ts`
+  - Added 5 internal helpers: `flavourToCanonicalType`, `getBlockInfo`, `walkBlockTree`, `deleteBlocksFromTree`, `findSectionRange`.
+  - Added 6 new tools: `list_blocks`, `find_blocks`, `delete_blocks`, `update_block`, `insert_markdown`, `move_block`, `replace_section`.
+  - Extended `find_and_replace` handler with `scopeBlockId` parameter using `collectDescendantBlockIds` for subtree scoping.
+  - Extended `replace_doc_with_markdown` handler with `preserveBlockIds` parameter using selective deletion + cursor-advancement insertion.
+  - Raised table row/column validation limit from 20 to 100 in both `normalizeAppendBlockInput` and `append_block` Zod schema.
+- `src/tools/comments.ts`
+  - Added `batch_resolve_comments` tool using fetch-first-then-categorize pattern (Option A).
+- `tests/test-block-tools.mjs`
+  - New E2E test suite covering all 8 new tools + 2 tool extensions + integration scenario.
+- `package.json`, `tool-manifest.json`, `CHANGELOG.md`, `RELEASE_NOTES.md`
+  - Bumped release metadata to `1.15.0`.
+  - Tool manifest expanded from 87 to 95 tools.
+
+### Validation Evidence
+- CI passed: `npm run ci` (build + tool-manifest + pack:check)
+- Code review passed: no critical or important issues remaining
+- Global install verified via `pnpm install -g .`
+
 ## Version 1.14.0 (2026-04-06)
 
 ### Highlights
