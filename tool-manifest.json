@@ -1,5 +1,5 @@
 {
-  "version": "1.15.0",
+  "version": "1.16.0",
   "tools": [
     "add_database_column",
     "add_database_row",
@@ -34,6 +34,7 @@
     "delete_organize_link",
     "delete_table_row",
     "delete_workspace",
+    "duplicate_block",
     "duplicate_doc",
     "export_doc_markdown",
     "find_and_replace",
@@ -72,6 +73,7 @@
     "read_database_cells",
     "read_database_columns",
     "read_doc",
+    "read_section",
     "read_table_cells",
     "remove_doc_from_collection",
     "remove_tag_from_doc",

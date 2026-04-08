@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 No unreleased changes yet.
 
+## [1.16.0] - 2026-04-09
+
+### Added
+- `read_section` — export one section as markdown without loading the entire document
+- `duplicate_block` — deep-copy a block and all descendants to a new position (works with tables)
+
+### Changed
+- `find_blocks` now searches inside table cell text (previously only searched `prop:text` via tree walk)
+- `find_and_replace` + `scopeHeadingId` — limit replacements to a heading section (siblings, not descendants)
+- `list_blocks` + `nested` — returns headings as a nested tree based on heading level hierarchy
+- Tool surface expanded from 95 to 97 canonical tools.
+
 ## [1.15.0] - 2026-04-09
 
 ### Added

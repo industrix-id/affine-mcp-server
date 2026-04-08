@@ -1,5 +1,33 @@
 # Release Notes
 
+## Version 1.16.0 (2026-04-09)
+
+### Highlights
+- Added `read_section` to export one heading section as markdown — avoids loading full documents (187K+ chars) when only one section is needed.
+- Added `duplicate_block` for deep-copying blocks and all descendants with new IDs. Works with all block types including tables.
+- Fixed `find_blocks` to search inside table cell text (previously missed due to tree-walk-only iteration).
+- Extended `find_and_replace` with `scopeHeadingId` for heading-section-scoped replacements.
+- Extended `list_blocks` with `nested` option for hierarchical heading outlines.
+
+### What Changed
+- `src/tools/docs.ts`
+  - Added `deepCopyBlock` helper for Y.js-aware deep copying (handles Y.Text, Y.Array, Y.Map, and flat table cell keys).
+  - Added `NestedBlockInfo` type for nested heading tree output.
+  - Added `read_section` tool reusing `findSectionRange` + `collectDocForMarkdown` + `renderBlocksToMarkdown` pipeline.
+  - Added `duplicate_block` tool using `deepCopyBlock` + `resolveInsertContext` for placement.
+  - Fixed `find_blocks` handler with second pass scanning `prop:cells.*` Y.Text fields on `affine:table` blocks.
+  - Extended `find_and_replace` handler with `scopeHeadingId` parameter using `findSectionRange` for section scoping (mutually exclusive with `scopeBlockId`).
+  - Extended `list_blocks` handler with `nested` parameter using stack-based tree builder for heading hierarchy.
+- `tool-manifest.json`
+  - Added `duplicate_block`, `read_section`. Tool count: 95 → 97.
+- `package.json`, `package-lock.json`, `CHANGELOG.md`, `RELEASE_NOTES.md`, `README.md`
+  - Bumped release metadata to `1.16.0`.
+
+### Validation Evidence
+- Build passed: `npm run build` (clean TypeScript compilation)
+- Tool manifest verified: `node scripts/verify-tool-manifest.mjs` (97 tools, all matched)
+- Global install verified via `pnpm install -g .`
+
 ## Version 1.15.0 (2026-04-09)
 
 ### Highlights
