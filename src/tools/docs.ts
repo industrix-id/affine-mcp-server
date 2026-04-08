@@ -911,11 +911,11 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
 
     if (normalized.type === "table") {
-      if (!Number.isInteger(normalized.rows) || normalized.rows < 1 || normalized.rows > 20) {
-        throw new Error("table rows must be an integer between 1 and 20.");
+      if (!Number.isInteger(normalized.rows) || normalized.rows < 1 || normalized.rows > 100) {
+        throw new Error("table rows must be an integer between 1 and 100.");
       }
-      if (!Number.isInteger(normalized.columns) || normalized.columns < 1 || normalized.columns > 20) {
-        throw new Error("table columns must be an integer between 1 and 20.");
+      if (!Number.isInteger(normalized.columns) || normalized.columns < 1 || normalized.columns > 100) {
+        throw new Error("table columns must be an integer between 1 and 100.");
       }
       if (normalized.tableData) {
         if (!Array.isArray(normalized.tableData) || normalized.tableData.length !== normalized.rows) {
@@ -1899,6 +1899,238 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
     return result;
   }
+
+  // ─── Block manipulation helpers ─────────────────────────────────────────────
+
+  function flavourToCanonicalType(block: Y.Map<any>): { canonicalType: string; headingLevel: number | null; listStyle: string | null } {
+    const flavour = (block.get("sys:flavour") as string) || "";
+    const propType = (block.get("prop:type") as string) || "";
+
+    switch (flavour) {
+      case "affine:paragraph": {
+        const m = propType.match(/^h([1-6])$/);
+        if (m) return { canonicalType: "heading", headingLevel: parseInt(m[1], 10), listStyle: null };
+        if (propType === "quote") return { canonicalType: "quote", headingLevel: null, listStyle: null };
+        return { canonicalType: "paragraph", headingLevel: null, listStyle: null };
+      }
+      case "affine:list":
+        return { canonicalType: "list", headingLevel: null, listStyle: propType || "bulleted" };
+      case "affine:code":
+        return { canonicalType: "code", headingLevel: null, listStyle: null };
+      case "affine:divider":
+        return { canonicalType: "divider", headingLevel: null, listStyle: null };
+      case "affine:callout":
+        return { canonicalType: "callout", headingLevel: null, listStyle: null };
+      case "affine:latex":
+        return { canonicalType: "latex", headingLevel: null, listStyle: null };
+      case "affine:table":
+        return { canonicalType: "table", headingLevel: null, listStyle: null };
+      case "affine:bookmark":
+        return { canonicalType: "bookmark", headingLevel: null, listStyle: null };
+      case "affine:image":
+        return { canonicalType: "image", headingLevel: null, listStyle: null };
+      case "affine:attachment":
+        return { canonicalType: "attachment", headingLevel: null, listStyle: null };
+      case "affine:database":
+        return { canonicalType: "database", headingLevel: null, listStyle: null };
+      case "affine:data-view":
+        return { canonicalType: "data_view", headingLevel: null, listStyle: null };
+      case "affine:surface-ref":
+        return { canonicalType: "surface_ref", headingLevel: null, listStyle: null };
+      case "affine:frame":
+        return { canonicalType: "frame", headingLevel: null, listStyle: null };
+      case "affine:edgeless-text":
+        return { canonicalType: "edgeless_text", headingLevel: null, listStyle: null };
+      case "affine:note":
+        return { canonicalType: "note", headingLevel: null, listStyle: null };
+      case "affine:page":
+        return { canonicalType: "page", headingLevel: null, listStyle: null };
+      case "affine:surface":
+        return { canonicalType: "surface", headingLevel: null, listStyle: null };
+      default:
+        if (flavour.startsWith("affine:embed-")) {
+          return { canonicalType: flavour.replace("affine:", "").replace(/-/g, "_"), headingLevel: null, listStyle: null };
+        }
+        return { canonicalType: flavour || "unknown", headingLevel: null, listStyle: null };
+    }
+  }
+
+  type BlockInfo = {
+    id: string;
+    type: string;
+    flavour: string;
+    textPreview: string;
+    depth: number;
+    childCount: number;
+    parentId: string | null;
+    headingLevel: number | null;
+    listStyle: string | null;
+    checked: boolean | null;
+  };
+
+  function getBlockInfo(blocks: Y.Map<any>, blockId: string, depth: number = 0, textPreviewLength: number = 80): BlockInfo | null {
+    const block = findBlockById(blocks, blockId);
+    if (!block) return null;
+    const { canonicalType, headingLevel, listStyle } = flavourToCanonicalType(block);
+    const rawText = asText(block.get("prop:text"));
+    const textPreview = rawText.length > textPreviewLength ? rawText.slice(0, textPreviewLength) + "..." : rawText;
+    const childIds = childIdsFrom(block.get("sys:children"));
+    const checked = block.get("prop:checked");
+    return {
+      id: blockId,
+      type: canonicalType,
+      flavour: (block.get("sys:flavour") as string) || "",
+      textPreview,
+      depth,
+      childCount: childIds.length,
+      parentId: findParentIdByChild(blocks, blockId),
+      headingLevel,
+      listStyle,
+      checked: typeof checked === "boolean" ? checked : null,
+    };
+  }
+
+  function walkBlockTree(
+    blocks: Y.Map<any>,
+    startIds: string[],
+    opts?: { maxDepth?: number; blockTypes?: string[]; textPreviewLength?: number }
+  ): BlockInfo[] {
+    const results: BlockInfo[] = [];
+    const visited = new Set<string>();
+    const maxDepth = opts?.maxDepth;
+    const blockTypes = opts?.blockTypes;
+    const textPreviewLength = opts?.textPreviewLength ?? 80;
+
+    function visit(blockId: string, depth: number) {
+      if (visited.has(blockId)) return;
+      visited.add(blockId);
+
+      const info = getBlockInfo(blocks, blockId, depth, textPreviewLength);
+      if (!info) return;
+
+      if (!blockTypes || blockTypes.includes(info.type)) {
+        results.push(info);
+      }
+
+      if (maxDepth !== undefined && depth >= maxDepth) return;
+
+      const block = findBlockById(blocks, blockId);
+      if (!block) return;
+      const childIds = childIdsFrom(block.get("sys:children"));
+      for (const childId of childIds) {
+        visit(childId, depth + 1);
+      }
+    }
+
+    for (const startId of startIds) {
+      visit(startId, 0);
+    }
+    return results;
+  }
+
+  function deleteBlocksFromTree(
+    blocks: Y.Map<any>,
+    blockIds: string[]
+  ): { deleted: string[]; notFound: string[] } {
+    const deleted: string[] = [];
+    const notFound: string[] = [];
+
+    // Group by parent and sort by descending index to avoid index shift
+    const byParent = new Map<string, { blockId: string; index: number }[]>();
+    for (const blockId of blockIds) {
+      const block = findBlockById(blocks, blockId);
+      if (!block) {
+        notFound.push(blockId);
+        continue;
+      }
+      const parentId = findParentIdByChild(blocks, blockId);
+      if (!parentId) {
+        // Orphan block — just delete it from the map
+        const descendants = collectDescendantBlockIds(blocks, [blockId]);
+        for (const id of descendants) blocks.delete(id);
+        deleted.push(blockId);
+        continue;
+      }
+      if (!byParent.has(parentId)) byParent.set(parentId, []);
+      const parentBlock = findBlockById(blocks, parentId)!;
+      const children = ensureChildrenArray(parentBlock);
+      const idx = indexOfChild(children, blockId);
+      byParent.get(parentId)!.push({ blockId, index: idx });
+    }
+
+    // Process each parent group in reverse index order
+    for (const [parentId, entries] of byParent) {
+      entries.sort((a, b) => b.index - a.index);
+      const parentBlock = findBlockById(blocks, parentId);
+      if (!parentBlock) continue;
+      const children = ensureChildrenArray(parentBlock);
+      for (const { blockId, index } of entries) {
+        if (index >= 0) {
+          children.delete(index, 1);
+        }
+        const descendants = collectDescendantBlockIds(blocks, [blockId]);
+        for (const id of descendants) blocks.delete(id);
+        deleted.push(blockId);
+      }
+    }
+
+    return { deleted, notFound };
+  }
+
+  function findSectionRange(
+    blocks: Y.Map<any>,
+    headingBlockId: string
+  ): { headingLevel: number; contentBlockIds: string[]; nextHeadingId: string | null } {
+    const block = findBlockById(blocks, headingBlockId);
+    if (!block) throw new Error(`Block '${headingBlockId}' was not found.`);
+
+    const flavour = block.get("sys:flavour") as string;
+    const propType = (block.get("prop:type") as string) || "";
+    if (flavour !== "affine:paragraph") {
+      throw new Error(`Block '${headingBlockId}' is not a heading (flavour: ${flavour}).`);
+    }
+    const levelMatch = propType.match(/^h([1-6])$/);
+    if (!levelMatch) {
+      throw new Error(`Block '${headingBlockId}' is not a heading (prop:type: ${propType}).`);
+    }
+    const headingLevel = parseInt(levelMatch[1], 10);
+
+    const parentId = findParentIdByChild(blocks, headingBlockId);
+    if (!parentId) throw new Error(`Heading block '${headingBlockId}' has no parent.`);
+
+    const parentBlock = findBlockById(blocks, parentId)!;
+    const children = ensureChildrenArray(parentBlock);
+    const siblingIds = childIdsFrom(children);
+    const headingIndex = siblingIds.indexOf(headingBlockId);
+    if (headingIndex < 0) throw new Error(`Heading block '${headingBlockId}' not found in parent's children.`);
+
+    const contentBlockIds: string[] = [];
+    let nextHeadingId: string | null = null;
+
+    for (let i = headingIndex + 1; i < siblingIds.length; i++) {
+      const sibId = siblingIds[i];
+      const sibBlock = findBlockById(blocks, sibId);
+      if (sibBlock) {
+        const sibFlavour = sibBlock.get("sys:flavour") as string;
+        const sibPropType = (sibBlock.get("prop:type") as string) || "";
+        if (sibFlavour === "affine:paragraph") {
+          const sibLevelMatch = sibPropType.match(/^h([1-6])$/);
+          if (sibLevelMatch) {
+            const sibLevel = parseInt(sibLevelMatch[1], 10);
+            if (sibLevel <= headingLevel) {
+              nextHeadingId = sibId;
+              break;
+            }
+          }
+        }
+      }
+      contentBlockIds.push(sibId);
+    }
+
+    return { headingLevel, contentBlockIds, nextHeadingId };
+  }
+
+  // ─── End block manipulation helpers ─────────────────────────────────────────
 
   function asStringOrNull(value: unknown): string | null {
     if (typeof value === "string") {
@@ -3391,8 +3623,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         mimeType: z.string().optional().describe("Attachment mime type"),
         size: z.number().optional().describe("Attachment/image file size in bytes"),
         embed: z.boolean().optional().describe("Attachment embed mode"),
-        rows: z.number().int().min(1).max(20).optional().describe("Table row count"),
-        columns: z.number().int().min(1).max(20).optional().describe("Table column count"),
+        rows: z.number().int().min(1).max(100).optional().describe("Table row count"),
+        columns: z.number().int().min(1).max(100).optional().describe("Table column count"),
         latex: z.string().optional().describe("Latex expression"),
         level: z.number().int().min(1).max(6).optional().describe("Heading level for type=heading"),
         style: AppendBlockListStyle.optional().describe("List style for type=list"),
@@ -3739,6 +3971,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     docId: string;
     markdown: string;
     strict?: boolean;
+    preserveBlockIds?: string[];
   }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) {
@@ -3746,6 +3979,128 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
 
     const parsedMarkdown = parseMarkdownToOperations(parsed.markdown);
+
+    // When preserveBlockIds is provided, use selective deletion instead of full replace
+    if (parsed.preserveBlockIds && parsed.preserveBlockIds.length > 0) {
+      const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+      const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+      const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+      try {
+        await joinWorkspace(socket, workspaceId);
+        const snap = await loadDoc(socket, workspaceId, parsed.docId);
+        if (!snap.missing) throw new Error(`Document ${parsed.docId} not found.`);
+        const doc = new Y.Doc();
+        Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+        const prevSV = Y.encodeStateVector(doc);
+        const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+        const noteBlockId = ensureNoteBlock(blocks);
+        const noteBlock = findBlockById(blocks, noteBlockId)!;
+        const noteChildren = ensureChildrenArray(noteBlock);
+        const existingChildIds = childIdsFrom(noteChildren);
+
+        // Categorize preserved vs non-preserved
+        const preserveSet = new Set(parsed.preserveBlockIds);
+        const notFound: string[] = [];
+        const preservedPositions = new Map<string, number>(); // blockId → original index
+
+        for (const pid of parsed.preserveBlockIds) {
+          if (!findBlockById(blocks, pid)) {
+            notFound.push(pid);
+            preserveSet.delete(pid);
+          }
+        }
+
+        // Record original positions of preserved blocks
+        for (let i = 0; i < existingChildIds.length; i++) {
+          if (preserveSet.has(existingChildIds[i])) {
+            preservedPositions.set(existingChildIds[i], i);
+          }
+        }
+
+        // Delete non-preserved blocks
+        const toDelete = existingChildIds.filter(id => !preserveSet.has(id));
+        deleteBlocksFromTree(blocks, toDelete);
+
+        // Insert new markdown around preserved blocks
+        // After deletion, note's children only contain preserved block IDs
+        const remainingChildIds = childIdsFrom(noteChildren);
+        let cursorIndex = 0;
+        let lastInsertedBlockId: string | undefined;
+        const insertedBlockIds: string[] = [];
+        let skippedCount = 0;
+        const skippedReasons: string[] = [];
+
+        for (const operation of parsedMarkdown.operations) {
+          // Skip past any preserved blocks at current position
+          while (cursorIndex < remainingChildIds.length && preserveSet.has(remainingChildIds[cursorIndex])) {
+            lastInsertedBlockId = remainingChildIds[cursorIndex];
+            cursorIndex++;
+          }
+
+          const placement = lastInsertedBlockId
+            ? { afterBlockId: lastInsertedBlockId }
+            : { parentId: noteBlockId };
+          const appendInput = markdownOperationToAppendInput(operation, parsed.docId, workspaceId, parsed.strict !== false, placement);
+          try {
+            const norm = normalizeAppendBlockInput(appendInput);
+            const context = resolveInsertContext(blocks, norm);
+            const { blockId, block, extraBlocks } = createBlock(norm);
+            blocks.set(blockId, block);
+            if (Array.isArray(extraBlocks)) {
+              for (const extra of extraBlocks) blocks.set(extra.blockId, extra.block);
+            }
+            if (context.insertIndex >= context.children.length) {
+              context.children.push([blockId]);
+            } else {
+              context.children.insert(context.insertIndex, [blockId]);
+            }
+            insertedBlockIds.push(blockId);
+            lastInsertedBlockId = blockId;
+            // Update remaining child IDs since we inserted
+            const updatedChildren = childIdsFrom(noteChildren);
+            const newIdx = updatedChildren.indexOf(blockId);
+            if (newIdx >= 0) cursorIndex = newIdx + 1;
+          } catch (err) {
+            skippedCount++;
+            skippedReasons.push(err instanceof Error ? err.message : String(err));
+          }
+        }
+
+        const delta = Y.encodeStateAsUpdate(doc, prevSV);
+        await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+        // Check if preserved blocks were repositioned
+        const finalChildIds = childIdsFrom(noteChildren);
+        const preservedBlocks = [...preserveSet].map(id => {
+          const originalIndex = preservedPositions.get(id);
+          const currentIndex = finalChildIds.indexOf(id);
+          return { id, repositioned: originalIndex !== currentIndex };
+        });
+
+        const applyWarnings: string[] = [];
+        if (skippedCount > 0) applyWarnings.push(`${skippedCount} markdown block(s) could not be applied: ${skippedReasons.slice(0, 3).join("; ")}`);
+
+        return text({
+          workspaceId,
+          docId: parsed.docId,
+          replaced: true,
+          warnings: mergeWarnings(parsedMarkdown.warnings, applyWarnings),
+          lossy: parsedMarkdown.lossy || skippedCount > 0,
+          stats: {
+            parsedBlocks: parsedMarkdown.operations.length,
+            appliedBlocks: insertedBlockIds.length,
+            skippedBlocks: skippedCount,
+          },
+          preservedBlocks,
+          notFound,
+        });
+      } finally {
+        socket.disconnect();
+      }
+    }
+
+    // Original path: no preserveBlockIds
     const applied = await applyMarkdownOperationsInternal({
       workspaceId,
       docId: parsed.docId,
@@ -3776,12 +4131,13 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     "replace_doc_with_markdown",
     {
       title: "Replace Document With Markdown",
-      description: "Replace the main note content of a document with markdown content.",
+      description: "Replace the main note content of a document with markdown content. Use preserveBlockIds to keep specific blocks (like embedded docs) alive during replacement.",
       inputSchema: {
         workspaceId: WorkspaceId.optional(),
         docId: DocId,
         markdown: MarkdownContent.describe("Markdown content to replace with"),
         strict: z.boolean().optional(),
+        preserveBlockIds: z.array(z.string()).optional().describe("Block IDs to preserve during replacement. Other blocks are deleted; new markdown is inserted around preserved ones."),
       },
     },
     replaceDocWithMarkdownHandler as any
@@ -3886,7 +4242,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
   // ─── find_and_replace ───────────────────────────────────────────────────────
   const findAndReplaceHandler = async (parsed: {
-    workspaceId?: string; docId: string; search: string; replace: string; matchAll?: boolean; dryRun?: boolean;
+    workspaceId?: string; docId: string; search: string; replace: string; matchAll?: boolean; dryRun?: boolean; scopeBlockId?: string;
   }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required.");
@@ -3900,11 +4256,18 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const doc = new Y.Doc();
       Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
       const blocks = doc.getMap("blocks") as Y.Map<any>;
+      const scopeIds = parsed.scopeBlockId
+        ? new Set(collectDescendantBlockIds(blocks, [parsed.scopeBlockId]))
+        : null;
+      if (parsed.scopeBlockId && (!scopeIds || scopeIds.size === 0)) {
+        throw new Error(`scopeBlockId '${parsed.scopeBlockId}' was not found.`);
+      }
       let totalMatches = 0;
       const matchLog: Array<{ blockId: string; flavour: string; original: string; replaced: string }> = [];
       const matchAll = parsed.matchAll !== false;
       for (const [blockId, raw] of blocks) {
         if (!(raw instanceof Y.Map)) continue;
+        if (scopeIds && !scopeIds.has(blockId)) continue;
         const flavour = raw.get("sys:flavour") as string | undefined;
         for (const [, val] of raw) {
           if (!(val instanceof Y.Text)) continue;
@@ -3941,6 +4304,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       replace: z.string().describe("Replacement text."),
       matchAll: z.boolean().optional().describe("Replace all occurrences (default: true)."),
       dryRun: z.boolean().optional().describe("If true, only report matches without replacing (default: false)."),
+      scopeBlockId: z.string().optional().describe("If provided, only search/replace within this block and its tree descendants (children, grandchildren, etc.). Note: for heading-scoped replacement, use replace_section instead — paragraphs under a heading are siblings, not descendants."),
     },
   }, findAndReplaceHandler as any);
 
@@ -6217,4 +6581,608 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
     limitDatabaseViewRowsHandler as any
   );
+
+  // ─── list_blocks ────────────────────────────────────────────────────────────
+  const listBlocksHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    maxDepth?: number;
+    blockTypes?: string[];
+    textPreviewLength?: number;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snap = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snap.missing) throw new Error(`Document ${parsed.docId} not found.`);
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      const pageBlockId = findBlockIdByFlavour(blocks, "affine:page");
+      if (!pageBlockId) throw new Error("Document has no page block.");
+      const pageBlock = findBlockById(blocks, pageBlockId)!;
+      const rootChildIds = childIdsFrom(pageBlock.get("sys:children"));
+
+      const result = walkBlockTree(blocks, rootChildIds, {
+        maxDepth: parsed.maxDepth,
+        blockTypes: parsed.blockTypes,
+        textPreviewLength: parsed.textPreviewLength ?? 80,
+      });
+      return text({ blocks: result, totalCount: result.length });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool("list_blocks", {
+    title: "List Blocks",
+    description: "Return a lightweight block tree with IDs, types, and text previews. Use to discover block IDs for other block manipulation tools.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: DocId,
+      maxDepth: z.number().int().min(0).optional().describe("Maximum tree depth to return. Omit for unlimited."),
+      blockTypes: z.array(z.string()).optional().describe("Filter to specific block types (e.g. ['heading', 'paragraph']). Still traverses children to find deeper matches."),
+      textPreviewLength: z.number().int().min(0).optional().describe("Max characters for text preview (default: 80)."),
+    },
+  }, listBlocksHandler as any);
+
+  // ─── find_blocks ────────────────────────────────────────────────────────────
+  const findBlocksHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    query: string;
+    blockTypes?: string[];
+    limit?: number;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snap = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snap.missing) throw new Error(`Document ${parsed.docId} not found.`);
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      const noteBlockId = ensureNoteBlock(blocks);
+      const noteBlock = findBlockById(blocks, noteBlockId)!;
+      const rootChildIds = childIdsFrom(noteBlock.get("sys:children"));
+
+      // Walk all blocks (unlimited depth)
+      const allBlocks = walkBlockTree(blocks, rootChildIds, {
+        blockTypes: parsed.blockTypes,
+        textPreviewLength: 200, // longer preview for search context
+      });
+
+      const queryLower = parsed.query.toLowerCase();
+      const limit = parsed.limit ?? 20;
+      const matches: BlockInfo[] = [];
+      let totalMatches = 0;
+
+      for (const info of allBlocks) {
+        // Search against full text, not just the preview
+        const block = findBlockById(blocks, info.id);
+        if (!block) continue;
+        const fullText = asText(block.get("prop:text"));
+        if (fullText.toLowerCase().includes(queryLower)) {
+          totalMatches++;
+          if (matches.length < limit) {
+            matches.push(info);
+          }
+        }
+      }
+
+      return text({ matches, totalMatches });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool("find_blocks", {
+    title: "Find Blocks",
+    description: "Search for blocks by text content. Returns matching block IDs with context. Case-insensitive substring match.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: DocId,
+      query: z.string().min(1).describe("Text to search for (case-insensitive substring match)."),
+      blockTypes: z.array(z.string()).optional().describe("Filter to specific block types."),
+      limit: z.number().int().min(1).optional().describe("Max results (default: 20)."),
+    },
+  }, findBlocksHandler as any);
+
+  // ─── delete_blocks ──────────────────────────────────────────────────────────
+  const deleteBlocksHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    blockIds: string[];
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snap = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snap.missing) throw new Error(`Document ${parsed.docId} not found.`);
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      // Prevent deleting structural blocks
+      const PROTECTED_FLAVOURS = new Set(["affine:page", "affine:surface", "affine:note"]);
+      for (const blockId of parsed.blockIds) {
+        const block = findBlockById(blocks, blockId);
+        if (block && PROTECTED_FLAVOURS.has(block.get("sys:flavour") as string)) {
+          throw new Error(`Cannot delete structural block '${blockId}' (${block.get("sys:flavour")}). Only content blocks can be deleted.`);
+        }
+      }
+
+      const prevSV = Y.encodeStateVector(doc);
+      const result = deleteBlocksFromTree(blocks, parsed.blockIds);
+
+      if (result.deleted.length > 0) {
+        const delta = Y.encodeStateAsUpdate(doc, prevSV);
+        await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      }
+
+      return text({ docId: parsed.docId, deleted: result.deleted, notFound: result.notFound });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool("delete_blocks", {
+    title: "Delete Blocks",
+    description: "Remove one or more blocks and their subtrees from a document by block ID. Non-existent block IDs are reported in notFound without error.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: DocId,
+      blockIds: z.array(z.string().min(1)).min(1).describe("Array of block IDs to delete."),
+    },
+  }, deleteBlocksHandler as any);
+
+  // ─── update_block ───────────────────────────────────────────────────────────
+  const updateBlockHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    blockId: string;
+    text?: string;
+    type?: string;
+    level?: number;
+    language?: string;
+    checked?: boolean;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snap = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snap.missing) throw new Error(`Document ${parsed.docId} not found.`);
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      const block = findBlockById(blocks, parsed.blockId);
+      if (!block) throw new Error(`Block '${parsed.blockId}' was not found.`);
+
+      const changes: string[] = [];
+      const hasAnyField = parsed.text !== undefined || parsed.type !== undefined ||
+        parsed.level !== undefined || parsed.language !== undefined || parsed.checked !== undefined;
+
+      if (!hasAnyField) {
+        return text({ updated: true, blockId: parsed.blockId, changes: [] });
+      }
+
+      const prevSV = Y.encodeStateVector(doc);
+
+      // Update text
+      if (parsed.text !== undefined) {
+        const propText = block.get("prop:text");
+        if (propText instanceof Y.Text) {
+          propText.delete(0, propText.length);
+          propText.insert(0, parsed.text);
+        } else {
+          block.set("prop:text", makeText(parsed.text));
+        }
+        changes.push("text");
+      }
+
+      // Update type (restricted to text-like family)
+      if (parsed.type !== undefined) {
+        const TYPE_MAP: Record<string, { flavour: string; propType: string }> = {
+          paragraph: { flavour: "affine:paragraph", propType: "text" },
+          heading: { flavour: "affine:paragraph", propType: `h${parsed.level ?? 1}` },
+          quote: { flavour: "affine:paragraph", propType: "quote" },
+          code: { flavour: "affine:code", propType: "" },
+          list: { flavour: "affine:list", propType: "bulleted" },
+          todo: { flavour: "affine:list", propType: "todo" },
+        };
+        const target = TYPE_MAP[parsed.type];
+        if (!target) {
+          throw new Error(`Cannot change block type to '${parsed.type}'. Supported: ${Object.keys(TYPE_MAP).join(", ")}`);
+        }
+        const currentFlavour = block.get("sys:flavour") as string;
+        if (currentFlavour !== target.flavour) {
+          block.set("sys:flavour", target.flavour);
+          block.set("sys:version", blockVersion(target.flavour));
+        }
+        if (target.propType) {
+          block.set("prop:type", target.propType);
+        }
+        if (parsed.type === "code") {
+          block.set("prop:language", parsed.language ?? "Plain Text");
+        }
+        changes.push("type");
+      }
+
+      // Update heading level
+      if (parsed.level !== undefined && parsed.type === undefined) {
+        const flavour = block.get("sys:flavour") as string;
+        const propType = (block.get("prop:type") as string) || "";
+        if (flavour !== "affine:paragraph" || !/^h[1-6]$/.test(propType)) {
+          throw new Error(`Cannot set level on non-heading block (flavour: ${flavour}, prop:type: ${propType}).`);
+        }
+        if (parsed.level < 1 || parsed.level > 6) throw new Error("Heading level must be 1-6.");
+        block.set("prop:type", `h${parsed.level}`);
+        changes.push("level");
+      }
+
+      // Update language
+      if (parsed.language !== undefined && parsed.type === undefined) {
+        const flavour = block.get("sys:flavour") as string;
+        if (flavour !== "affine:code") {
+          throw new Error(`Cannot set language on non-code block (flavour: ${flavour}).`);
+        }
+        block.set("prop:language", parsed.language);
+        changes.push("language");
+      }
+
+      // Update checked
+      if (parsed.checked !== undefined) {
+        const flavour = block.get("sys:flavour") as string;
+        const propType = (block.get("prop:type") as string) || "";
+        if (flavour !== "affine:list" || propType !== "todo") {
+          throw new Error(`Cannot set checked on non-todo block (flavour: ${flavour}, prop:type: ${propType}).`);
+        }
+        block.set("prop:checked", parsed.checked);
+        changes.push("checked");
+      }
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({ updated: true, blockId: parsed.blockId, changes });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool("update_block", {
+    title: "Update Block",
+    description: "Update a single block's text content, type, or properties without replacing it. The block retains its ID and position. Type changes restricted to: paragraph, heading, quote, code, list, todo.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: DocId,
+      blockId: z.string().min(1).describe("Block ID to update."),
+      text: z.string().optional().describe("New text content."),
+      type: z.string().optional().describe("New block type (paragraph, heading, quote, code, list, todo)."),
+      level: z.number().int().min(1).max(6).optional().describe("Heading level 1-6. Only for heading type."),
+      language: z.string().optional().describe("Code language. Only for code blocks."),
+      checked: z.boolean().optional().describe("Todo checked state. Only for todo list blocks."),
+    },
+  }, updateBlockHandler as any);
+
+  // ─── insert_markdown ────────────────────────────────────────────────────────
+  const insertMarkdownHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    markdown: string;
+    placement: AppendPlacement;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+
+    // Validate placement — at least one must be set
+    const normalized = normalizePlacement(parsed.placement);
+    if (!normalized) {
+      throw new Error("placement must specify afterBlockId, beforeBlockId, or parentId.");
+    }
+
+    const parsedMarkdown = parseMarkdownToOperations(parsed.markdown);
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snap = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snap.missing) throw new Error(`Document ${parsed.docId} not found.`);
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+      const prevSV = Y.encodeStateVector(doc);
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      let currentPlacement: AppendPlacement | undefined = normalized;
+      let lastInsertedBlockId: string | undefined;
+      const blockIds: string[] = [];
+      let skippedCount = 0;
+      const skippedReasons: string[] = [];
+
+      for (const operation of parsedMarkdown.operations) {
+        const placement = lastInsertedBlockId ? { afterBlockId: lastInsertedBlockId } : currentPlacement;
+        const appendInput = markdownOperationToAppendInput(operation, parsed.docId, workspaceId, true, placement);
+        try {
+          const norm = normalizeAppendBlockInput(appendInput);
+          const context = resolveInsertContext(blocks, norm);
+          const { blockId, block, extraBlocks } = createBlock(norm);
+          blocks.set(blockId, block);
+          if (Array.isArray(extraBlocks)) {
+            for (const extra of extraBlocks) blocks.set(extra.blockId, extra.block);
+          }
+          if (context.insertIndex >= context.children.length) {
+            context.children.push([blockId]);
+          } else {
+            context.children.insert(context.insertIndex, [blockId]);
+          }
+          blockIds.push(blockId);
+          lastInsertedBlockId = blockId;
+        } catch (err) {
+          skippedCount++;
+          skippedReasons.push(err instanceof Error ? err.message : String(err));
+        }
+      }
+
+      if (blockIds.length > 0) {
+        const delta = Y.encodeStateAsUpdate(doc, prevSV);
+        await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      }
+
+      const warnings = parsedMarkdown.warnings.slice();
+      if (skippedCount > 0) warnings.push(`${skippedCount} block(s) could not be inserted: ${skippedReasons.slice(0, 3).join("; ")}`);
+
+      return text({
+        docId: parsed.docId,
+        insertedBlockIds: blockIds,
+        stats: { parsedBlocks: parsedMarkdown.operations.length, appliedBlocks: blockIds.length, skippedBlocks: skippedCount },
+        warnings,
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool("insert_markdown", {
+    title: "Insert Markdown at Position",
+    description: "Insert markdown content at a specific position in a document. Like append_markdown but with positional control via placement.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: DocId,
+      markdown: MarkdownContent.describe("Markdown content to insert."),
+      placement: z.object({
+        afterBlockId: z.string().optional().describe("Insert after this block."),
+        beforeBlockId: z.string().optional().describe("Insert before this block."),
+        parentId: z.string().optional().describe("Insert as child of this block."),
+        index: z.number().int().min(0).optional().describe("Insertion index within parent."),
+      }).describe("Where to insert. Exactly one of afterBlockId, beforeBlockId, or parentId is required."),
+    },
+  }, insertMarkdownHandler as any);
+
+  // ─── move_block ─────────────────────────────────────────────────────────────
+  const moveBlockHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    blockId: string;
+    placement: AppendPlacement;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const normalized = normalizePlacement(parsed.placement);
+    if (!normalized) {
+      throw new Error("placement must specify afterBlockId, beforeBlockId, or parentId.");
+    }
+
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snap = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snap.missing) throw new Error(`Document ${parsed.docId} not found.`);
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      const block = findBlockById(blocks, parsed.blockId);
+      if (!block) throw new Error(`Block '${parsed.blockId}' was not found.`);
+
+      // Record original position
+      const fromParentId = findParentIdByChild(blocks, parsed.blockId);
+      if (!fromParentId) throw new Error(`Block '${parsed.blockId}' has no parent — cannot move.`);
+      const fromParentBlock = findBlockById(blocks, fromParentId)!;
+      const fromChildren = ensureChildrenArray(fromParentBlock);
+      const fromIndex = indexOfChild(fromChildren, parsed.blockId);
+      if (fromIndex < 0) throw new Error(`Block '${parsed.blockId}' not found in parent's children.`);
+
+      const prevSV = Y.encodeStateVector(doc);
+
+      // Remove before resolve (correct index ordering)
+      fromChildren.delete(fromIndex, 1);
+
+      // Resolve new placement using a minimal NormalizedAppendBlockInput
+      const minimalNormalized: NormalizedAppendBlockInput = {
+        docId: parsed.docId,
+        type: "paragraph" as AppendBlockCanonicalType,
+        strict: false,
+        placement: normalized,
+        text: "", url: "", pageId: "", iframeUrl: "", html: "", design: "", reference: "", refFlavour: "",
+        width: 0, height: 0, background: "", sourceId: "", name: "", mimeType: "", size: 0,
+        headingLevel: 1, listStyle: "bulleted" as AppendBlockListStyle, checked: false,
+        caption: "", bookmarkStyle: "horizontal" as AppendBlockBookmarkStyle,
+        embed: false, latex: "", language: "", rows: 0, columns: 0,
+        dataViewMode: "table" as AppendBlockDataViewMode,
+      };
+      const context = resolveInsertContext(blocks, minimalNormalized);
+
+      // No-op detection
+      if (fromParentId === context.parentId && fromIndex === context.insertIndex) {
+        // Re-insert at original position (undo the removal)
+        fromChildren.insert(fromIndex, [parsed.blockId]);
+        return text({ moved: false, blockId: parsed.blockId, reason: "Block is already at the target position." });
+      }
+
+      // Insert at new position
+      if (context.insertIndex >= context.children.length) {
+        context.children.push([parsed.blockId]);
+      } else {
+        context.children.insert(context.insertIndex, [parsed.blockId]);
+      }
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        moved: true,
+        blockId: parsed.blockId,
+        from: { parentId: fromParentId, index: fromIndex },
+        to: { parentId: context.parentId, index: context.insertIndex },
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool("move_block", {
+    title: "Move Block",
+    description: "Move an existing block (and its subtree) to a new position within the same document. All children move with the parent.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: DocId,
+      blockId: z.string().min(1).describe("Block ID to move."),
+      placement: z.object({
+        afterBlockId: z.string().optional().describe("Move after this block."),
+        beforeBlockId: z.string().optional().describe("Move before this block."),
+        parentId: z.string().optional().describe("Move as child of this block."),
+        index: z.number().int().min(0).optional().describe("Insertion index within parent."),
+      }).describe("Where to move. Exactly one of afterBlockId, beforeBlockId, or parentId is required."),
+    },
+  }, moveBlockHandler as any);
+
+  // ─── replace_section ────────────────────────────────────────────────────────
+  const replaceSectionHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    headingBlockId: string;
+    markdown: string;
+    includeHeading?: boolean;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snap = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snap.missing) throw new Error(`Document ${parsed.docId} not found.`);
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      const { headingLevel, contentBlockIds, nextHeadingId } = findSectionRange(blocks, parsed.headingBlockId);
+      const parsedMarkdown = parseMarkdownToOperations(parsed.markdown);
+      let bodyOperations = parsedMarkdown.operations;
+
+      const prevSV = Y.encodeStateVector(doc);
+
+      // Handle includeHeading
+      if (parsed.includeHeading) {
+        if (bodyOperations.length === 0 || bodyOperations[0].type !== "heading") {
+          throw new Error("markdown must start with a heading line when includeHeading is true.");
+        }
+        const headingOp = bodyOperations[0];
+        bodyOperations = bodyOperations.slice(1);
+
+        // Update heading block's text in place
+        const headingBlock = findBlockById(blocks, parsed.headingBlockId)!;
+        const propText = headingBlock.get("prop:text");
+        if (propText instanceof Y.Text) {
+          propText.delete(0, propText.length);
+          propText.insert(0, headingOp.text);
+        } else {
+          headingBlock.set("prop:text", makeText(headingOp.text));
+        }
+        // Update heading level
+        const newLevel = headingOp.level ?? 1;
+        headingBlock.set("prop:type", `h${newLevel}`);
+      }
+
+      // Delete section content blocks
+      const deleteResult = deleteBlocksFromTree(blocks, contentBlockIds);
+
+      // Insert new body content after the heading block
+      let lastInsertedBlockId: string | undefined;
+      const insertedBlockIds: string[] = [];
+      let skippedCount = 0;
+      const skippedReasons: string[] = [];
+
+      for (const operation of bodyOperations) {
+        const placement = lastInsertedBlockId
+          ? { afterBlockId: lastInsertedBlockId }
+          : { afterBlockId: parsed.headingBlockId };
+        const appendInput = markdownOperationToAppendInput(operation, parsed.docId, workspaceId, true, placement);
+        try {
+          const norm = normalizeAppendBlockInput(appendInput);
+          const context = resolveInsertContext(blocks, norm);
+          const { blockId, block, extraBlocks } = createBlock(norm);
+          blocks.set(blockId, block);
+          if (Array.isArray(extraBlocks)) {
+            for (const extra of extraBlocks) blocks.set(extra.blockId, extra.block);
+          }
+          if (context.insertIndex >= context.children.length) {
+            context.children.push([blockId]);
+          } else {
+            context.children.insert(context.insertIndex, [blockId]);
+          }
+          insertedBlockIds.push(blockId);
+          lastInsertedBlockId = blockId;
+        } catch (err) {
+          skippedCount++;
+          skippedReasons.push(err instanceof Error ? err.message : String(err));
+        }
+      }
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      const allWarnings = parsedMarkdown.warnings.slice();
+      if (skippedCount > 0) allWarnings.push(`${skippedCount} block(s) could not be inserted: ${skippedReasons.slice(0, 3).join("; ")}`);
+
+      return text({
+        docId: parsed.docId,
+        deletedBlockCount: deleteResult.deleted.length,
+        insertedBlockCount: insertedBlockIds.length,
+        insertedBlockIds,
+        sectionRange: { from: parsed.headingBlockId, to: nextHeadingId },
+        warnings: allWarnings,
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool("replace_section", {
+    title: "Replace Section",
+    description: "Replace all content under a heading block until the next heading of the same or higher level. The heading itself is preserved unless includeHeading is true (in which case, markdown must start with a heading line).",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: DocId,
+      headingBlockId: z.string().min(1).describe("Block ID of the heading whose section to replace."),
+      markdown: MarkdownContent.describe("New content for the section body. If includeHeading is true, first line must be a heading."),
+      includeHeading: z.boolean().optional().describe("If true, also replace the heading text/level. Markdown must start with a heading line (default: false)."),
+    },
+  }, replaceSectionHandler as any);
 }

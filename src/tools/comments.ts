@@ -106,4 +106,52 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     },
     resolveCommentHandler as any
   );
+
+  // ─── batch_resolve_comments ─────────────────────────────────────────────────
+  const batchResolveCommentsHandler = async (parsed: { workspaceId?: string; docId: string; commentIds: string[] }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId required (or set AFFINE_WORKSPACE_ID)");
+
+    // Fetch all comments to categorize
+    const listQuery = `query ListComments($workspaceId:String!,$docId:String!,$first:Int){ workspace(id:$workspaceId){ comments(docId:$docId, pagination:{first:$first}){ totalCount edges{ node{ id resolved } } } } }`;
+    const listData = await gql.request<{ workspace: any }>(listQuery, { workspaceId, docId: parsed.docId, first: 1000 });
+    const commentMap = new Map<string, boolean>();
+    for (const edge of (listData.workspace?.comments?.edges || [])) {
+      commentMap.set(edge.node.id, edge.node.resolved);
+    }
+
+    const resolved: string[] = [];
+    const alreadyResolved: string[] = [];
+    const notFound: string[] = [];
+
+    const resolveMutation = `mutation ResolveComment($input: CommentResolveInput!){ resolveComment(input:$input) }`;
+
+    for (const commentId of parsed.commentIds) {
+      if (!commentMap.has(commentId)) {
+        notFound.push(commentId);
+        continue;
+      }
+      if (commentMap.get(commentId) === true) {
+        alreadyResolved.push(commentId);
+        continue;
+      }
+      await gql.request<{ resolveComment: boolean }>(resolveMutation, { input: { id: commentId, resolved: true } });
+      resolved.push(commentId);
+    }
+
+    return text({ resolved, alreadyResolved, notFound });
+  };
+  server.registerTool(
+    "batch_resolve_comments",
+    {
+      title: "Batch Resolve Comments",
+      description: "Resolve multiple comments on a document in a single call. Already-resolved and not-found comments are reported separately.",
+      inputSchema: {
+        workspaceId: z.string().optional(),
+        docId: z.string().describe("Document ID containing the comments."),
+        commentIds: z.array(z.string()).min(1).describe("Array of comment IDs to resolve."),
+      }
+    },
+    batchResolveCommentsHandler as any
+  );
 }
