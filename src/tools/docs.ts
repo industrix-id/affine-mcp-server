@@ -1900,6 +1900,67 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     return result;
   }
 
+  function deepCopyBlock(
+    blocks: Y.Map<any>,
+    sourceBlockId: string
+  ): { rootCopyId: string; copies: Array<{ id: string; block: Y.Map<any> }>; descendantCount: number } {
+    const allIds = collectDescendantBlockIds(blocks, [sourceBlockId]);
+    const idRemap = new Map<string, string>();
+    for (const oldId of allIds) {
+      idRemap.set(oldId, generateId());
+    }
+
+    const copies: Array<{ id: string; block: Y.Map<any> }> = [];
+
+    for (const oldId of allIds) {
+      const srcBlock = findBlockById(blocks, oldId);
+      if (!srcBlock) continue;
+
+      const newId = idRemap.get(oldId)!;
+      const newBlock = new Y.Map<any>();
+
+      srcBlock.forEach((value: any, key: string) => {
+        if (key === "sys:id") {
+          newBlock.set(key, newId);
+        } else if (key === "sys:children") {
+          const oldChildIds = childIdsFrom(value);
+          const newChildren = new Y.Array<string>();
+          const remapped = oldChildIds
+            .map(cid => idRemap.get(cid))
+            .filter((cid): cid is string => cid !== undefined);
+          if (remapped.length > 0) {
+            newChildren.insert(0, remapped);
+          }
+          newBlock.set(key, newChildren);
+        } else if (key === "sys:parent") {
+          newBlock.set(key, null);
+        } else if (value instanceof Y.Text) {
+          newBlock.set(key, makeText(value.toString()));
+        } else if (value instanceof Y.Array) {
+          const newArr = new Y.Array();
+          const items: any[] = [];
+          value.forEach((item: any) => items.push(item));
+          if (items.length > 0) newArr.insert(0, items);
+          newBlock.set(key, newArr);
+        } else if (value instanceof Y.Map) {
+          const newMap = new Y.Map();
+          value.forEach((v: any, k: string) => newMap.set(k, v));
+          newBlock.set(key, newMap);
+        } else {
+          newBlock.set(key, value);
+        }
+      });
+
+      copies.push({ id: newId, block: newBlock });
+    }
+
+    return {
+      rootCopyId: idRemap.get(sourceBlockId)!,
+      copies,
+      descendantCount: allIds.length - 1,
+    };
+  }
+
   // ─── Block manipulation helpers ─────────────────────────────────────────────
 
   function flavourToCanonicalType(block: Y.Map<any>): { canonicalType: string; headingLevel: number | null; listStyle: string | null } {
@@ -1966,6 +2027,14 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     headingLevel: number | null;
     listStyle: string | null;
     checked: boolean | null;
+  };
+
+  type NestedBlockInfo = {
+    id: string;
+    type: string;
+    textPreview: string;
+    headingLevel: number;
+    children: NestedBlockInfo[];
   };
 
   function getBlockInfo(blocks: Y.Map<any>, blockId: string, depth: number = 0, textPreviewLength: number = 80): BlockInfo | null {
@@ -4242,10 +4311,13 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
   // ─── find_and_replace ───────────────────────────────────────────────────────
   const findAndReplaceHandler = async (parsed: {
-    workspaceId?: string; docId: string; search: string; replace: string; matchAll?: boolean; dryRun?: boolean; scopeBlockId?: string;
+    workspaceId?: string; docId: string; search: string; replace: string; matchAll?: boolean; dryRun?: boolean; scopeBlockId?: string; scopeHeadingId?: string;
   }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required.");
+    if (parsed.scopeBlockId && parsed.scopeHeadingId) {
+      throw new Error("scopeBlockId and scopeHeadingId are mutually exclusive. Provide only one.");
+    }
     const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
     const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
@@ -4256,11 +4328,15 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const doc = new Y.Doc();
       Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
       const blocks = doc.getMap("blocks") as Y.Map<any>;
-      const scopeIds = parsed.scopeBlockId
-        ? new Set(collectDescendantBlockIds(blocks, [parsed.scopeBlockId]))
-        : null;
-      if (parsed.scopeBlockId && (!scopeIds || scopeIds.size === 0)) {
-        throw new Error(`scopeBlockId '${parsed.scopeBlockId}' was not found.`);
+      let scopeIds: Set<string> | null = null;
+      if (parsed.scopeBlockId) {
+        scopeIds = new Set(collectDescendantBlockIds(blocks, [parsed.scopeBlockId]));
+        if (scopeIds.size === 0) {
+          throw new Error(`scopeBlockId '${parsed.scopeBlockId}' was not found.`);
+        }
+      } else if (parsed.scopeHeadingId) {
+        const { contentBlockIds } = findSectionRange(blocks, parsed.scopeHeadingId);
+        scopeIds = new Set([parsed.scopeHeadingId, ...contentBlockIds]);
       }
       let totalMatches = 0;
       const matchLog: Array<{ blockId: string; flavour: string; original: string; replaced: string }> = [];
@@ -4304,7 +4380,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       replace: z.string().describe("Replacement text."),
       matchAll: z.boolean().optional().describe("Replace all occurrences (default: true)."),
       dryRun: z.boolean().optional().describe("If true, only report matches without replacing (default: false)."),
-      scopeBlockId: z.string().optional().describe("If provided, only search/replace within this block and its tree descendants (children, grandchildren, etc.). Note: for heading-scoped replacement, use replace_section instead — paragraphs under a heading are siblings, not descendants."),
+      scopeBlockId: z.string().optional().describe("If provided, only search/replace within this block and its tree descendants (children, grandchildren, etc.). Mutually exclusive with scopeHeadingId."),
+      scopeHeadingId: z.string().optional().describe("If provided, only search/replace within the section under this heading (heading block + content until next same-or-higher-level heading). Mutually exclusive with scopeBlockId."),
     },
   }, findAndReplaceHandler as any);
 
@@ -6589,6 +6666,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     maxDepth?: number;
     blockTypes?: string[];
     textPreviewLength?: number;
+    nested?: boolean;
   }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required.");
@@ -6608,10 +6686,48 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const pageBlock = findBlockById(blocks, pageBlockId)!;
       const rootChildIds = childIdsFrom(pageBlock.get("sys:children"));
 
+      const previewLen = parsed.textPreviewLength ?? 80;
+
+      if (parsed.nested) {
+        // Walk all blocks (no blockTypes filter) then filter to headings
+        const allBlocks = walkBlockTree(blocks, rootChildIds, {
+          textPreviewLength: previewLen,
+        });
+        const headings = allBlocks.filter(b => b.headingLevel !== null);
+
+        // Build nested tree using a stack
+        const roots: NestedBlockInfo[] = [];
+        const stack: NestedBlockInfo[] = [];
+
+        for (const h of headings) {
+          const node: NestedBlockInfo = {
+            id: h.id,
+            type: h.type,
+            textPreview: h.textPreview,
+            headingLevel: h.headingLevel!,
+            children: [],
+          };
+
+          // Pop stack until we find a heading with a strictly lower level number (higher rank)
+          while (stack.length > 0 && stack[stack.length - 1].headingLevel >= h.headingLevel!) {
+            stack.pop();
+          }
+
+          if (stack.length === 0) {
+            roots.push(node);
+          } else {
+            stack[stack.length - 1].children.push(node);
+          }
+          stack.push(node);
+        }
+
+        return text({ blocks: roots, totalCount: headings.length });
+      }
+
       const result = walkBlockTree(blocks, rootChildIds, {
         maxDepth: parsed.maxDepth,
         blockTypes: parsed.blockTypes,
-        textPreviewLength: parsed.textPreviewLength ?? 80,
+        textPreviewLength: previewLen,
       });
       return text({ blocks: result, totalCount: result.length });
     } finally {
@@ -6627,6 +6743,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       maxDepth: z.number().int().min(0).optional().describe("Maximum tree depth to return. Omit for unlimited."),
       blockTypes: z.array(z.string()).optional().describe("Filter to specific block types (e.g. ['heading', 'paragraph']). Still traverses children to find deeper matches."),
       textPreviewLength: z.number().int().min(0).optional().describe("Max characters for text preview (default: 80)."),
+      nested: z.boolean().optional().describe("If true, return only headings organized as a nested tree based on heading levels (h1 > h2 > h3 etc.). Ignores blockTypes and maxDepth when enabled. Default: false."),
     },
   }, listBlocksHandler as any);
 
@@ -6679,6 +6796,43 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         }
       }
 
+      // Second pass: search inside table cell text (stored as flat prop:cells.* Y.Text fields)
+      const includeTableCells = !parsed.blockTypes || parsed.blockTypes.includes("table");
+      if (includeTableCells) {
+        const matchedIds = new Set(matches.map(m => m.id));
+        for (const [blockId, raw] of blocks) {
+          if (!(raw instanceof Y.Map)) continue;
+          if (matchedIds.has(blockId)) continue;
+          const flavour = raw.get("sys:flavour") as string;
+          if (flavour !== "affine:table") continue;
+
+          // Scan cell text fields for matches
+          let firstMatchText: string | null = null;
+          for (const [key, val] of raw) {
+            if (!key.startsWith("prop:cells.") || !(val instanceof Y.Text)) continue;
+            const cellText = val.toString();
+            if (cellText.toLowerCase().includes(queryLower)) {
+              if (!firstMatchText) firstMatchText = cellText;
+              break;
+            }
+          }
+
+          if (firstMatchText) {
+            totalMatches++;
+            if (matches.length < limit) {
+              const info = getBlockInfo(blocks, blockId, 0, 200);
+              if (info) {
+                // Use the matching cell text as preview since table blocks have no prop:text
+                info.textPreview = firstMatchText.length > 200
+                  ? firstMatchText.slice(0, 200) + "..."
+                  : firstMatchText;
+                matches.push(info);
+              }
+            }
+          }
+        }
+      }
+
       return text({ matches, totalMatches });
     } finally {
       socket.disconnect();
@@ -6686,7 +6840,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   };
   server.registerTool("find_blocks", {
     title: "Find Blocks",
-    description: "Search for blocks by text content. Returns matching block IDs with context. Case-insensitive substring match.",
+    description: "Search for blocks by text content, including text inside table cells. Returns matching block IDs with context. Case-insensitive substring match. Table cell matches return the parent table block ID.",
     inputSchema: {
       workspaceId: z.string().optional(),
       docId: DocId,
@@ -7185,4 +7339,145 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       includeHeading: z.boolean().optional().describe("If true, also replace the heading text/level. Markdown must start with a heading line (default: false)."),
     },
   }, replaceSectionHandler as any);
+
+  // ─── read_section ────────────────────────────────────────────────────────────
+  const readSectionHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    headingBlockId: string;
+    includeHeading?: boolean;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snap = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snap.missing) throw new Error(`Document ${parsed.docId} not found.`);
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      const { headingLevel, contentBlockIds, nextHeadingId } = findSectionRange(blocks, parsed.headingBlockId);
+
+      const headingBlock = findBlockById(blocks, parsed.headingBlockId)!;
+      const headingText = asText(headingBlock.get("prop:text"));
+
+      const includeHeading = parsed.includeHeading !== false;
+      const rootBlockIds = includeHeading
+        ? [parsed.headingBlockId, ...contentBlockIds]
+        : [...contentBlockIds];
+
+      // Build full blocksById map (renderBlocksToMarkdown needs child resolution)
+      const { blocksById } = collectDocForMarkdown(doc);
+
+      const rendered = renderBlocksToMarkdown({ rootBlockIds, blocksById });
+
+      return text({
+        headingBlockId: parsed.headingBlockId,
+        headingText,
+        headingLevel,
+        markdown: rendered.markdown,
+        blockCount: rootBlockIds.length,
+        nextHeadingId,
+        warnings: rendered.warnings,
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool("read_section", {
+    title: "Read Section",
+    description: "Export one section as markdown. A section starts at a heading and extends until the next heading of the same or higher level. Much more efficient than exporting the entire document when you only need one section.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: DocId,
+      headingBlockId: z.string().min(1).describe("Block ID of the heading whose section to read."),
+      includeHeading: z.boolean().optional().describe("Whether to include the heading itself in the output (default: true)."),
+    },
+  }, readSectionHandler as any);
+
+  // ─── duplicate_block ─────────────────────────────────────────────────────────
+  const duplicateBlockHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    blockId: string;
+    placement?: { parentId?: string; afterBlockId?: string; beforeBlockId?: string; index?: number };
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snap = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snap.missing) throw new Error(`Document ${parsed.docId} not found.`);
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      const sourceBlock = findBlockById(blocks, parsed.blockId);
+      if (!sourceBlock) throw new Error(`Block '${parsed.blockId}' not found.`);
+
+      const PROTECTED_FLAVOURS = new Set(["affine:page", "affine:surface", "affine:note"]);
+      const sourceFlavour = sourceBlock.get("sys:flavour") as string;
+      if (PROTECTED_FLAVOURS.has(sourceFlavour)) {
+        throw new Error(`Cannot duplicate structural block '${parsed.blockId}' (${sourceFlavour}).`);
+      }
+
+      const prevSV = Y.encodeStateVector(doc);
+
+      const { rootCopyId, copies, descendantCount } = deepCopyBlock(blocks, parsed.blockId);
+
+      // Insert all copied blocks into the blocks Y.Map
+      for (const { id, block } of copies) {
+        blocks.set(id, block);
+      }
+
+      // Determine placement: default to immediately after the original block
+      const placement = normalizePlacement(parsed.placement) ?? { afterBlockId: parsed.blockId };
+
+      // Resolve insertion context using the same logic as insert_markdown / move_block
+      const context = resolveInsertContext(blocks, {
+        type: "paragraph",
+        placement,
+        strict: false,
+      } as NormalizedAppendBlockInput);
+
+      if (context.insertIndex >= context.children.length) {
+        context.children.push([rootCopyId]);
+      } else {
+        context.children.insert(context.insertIndex, [rootCopyId]);
+      }
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        duplicatedBlockId: rootCopyId,
+        originalBlockId: parsed.blockId,
+        descendantCount,
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool("duplicate_block", {
+    title: "Duplicate Block",
+    description: "Deep-copy a block and all its descendants (new block IDs, same content/structure/properties), inserting the copy at the specified position. Defaults to immediately after the original block. Works with all block types including tables.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: DocId,
+      blockId: z.string().min(1).describe("Block ID to duplicate."),
+      placement: z.object({
+        parentId: z.string().optional(),
+        afterBlockId: z.string().optional(),
+        beforeBlockId: z.string().optional(),
+        index: z.number().int().min(0).optional(),
+      }).optional().describe("Where to insert the copy. Same placement object as insert_markdown/move_block. Defaults to immediately after the original block."),
+    },
+  }, duplicateBlockHandler as any);
 }
